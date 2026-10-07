@@ -28,6 +28,7 @@
 | Swift / Swift Package Manager | コンパイル、共通処理のテスト | Apache License 2.0。SwiftにはRuntime Library Exceptionがある。[Swiftのライセンス](https://github.com/swiftlang/swift/blob/main/LICENSE.txt) |
 | Xcode / Apple SDK | macOS・iOSのビルド、シミュレーター | Appleの開発ツール・SDK使用条件。ツール本体を同梱しない |
 | Python 3 標準ライブラリ | Xcodeプロジェクト生成、構成確認、シミュレーター起動 | PSF License。[Pythonのライセンス](https://docs.python.org/3/license.html)。外部Pythonパッケージ不要 |
+| PyYAML | 作業環境でのワークフロー構文確認のみ | [MIT](https://github.com/yaml/pyyaml/blob/main/LICENSE)。アプリ・CI・配布スクリプトには不要 |
 | Git / GitHub CLI | バージョン管理、公開 | Git: GPL-2.0、GitHub CLI: MIT。開発時に使用し、アプリに同梱しない |
 
 ## GitHub Actionsで使用する外部Action
@@ -36,6 +37,7 @@
 | --- | --- | --- |
 | actions/checkout v4.2.2 | `11bd71901bbe5b1630ceea73d27597364c9af683` | [MIT](https://github.com/actions/checkout/blob/11bd71901bbe5b1630ceea73d27597364c9af683/LICENSE) |
 | actions/upload-artifact v4.6.2 | `ea165f8d65b6e75b540449e92b4886f43607fa02` | [MIT](https://github.com/actions/upload-artifact/blob/ea165f8d65b6e75b540449e92b4886f43607fa02/LICENSE) |
+| actions/download-artifact v4.3.0 | `d3f86a106a0bac45b974a628896c90dbdf5c8093` | [MIT](https://github.com/actions/download-artifact/blob/d3f86a106a0bac45b974a628896c90dbdf5c8093/LICENSE) |
 
 これらはCIの実行時に使用し、アプリ本体に含めません。
 

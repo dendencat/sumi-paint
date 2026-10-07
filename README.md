@@ -4,6 +4,14 @@ Mac・iPad・iPhone向けの独自のお絵かきアプリ。調整できるブ�
 
 SwiftUIとMetalを使用し、アプリに組み込む外部パッケージはありません。
 
+[![Build, test, and preview](https://github.com/dendencat/sumi-paint/actions/workflows/ci.yml/badge.svg)](https://github.com/dendencat/sumi-paint/actions/workflows/ci.yml)
+
+## プレビューを試す
+
+[`main`の検証済みプレビューをダウンロード](https://github.com/dendencat/sumi-paint/releases)。変更ごとにMac用アプリ、iPhone・iPadシミュレーター用アプリ、起動時の画面を自動公開します。
+
+[インストール手順](docs/preview-install.md)と[CI/CDの構成](docs/ci-cd.md)を参照してください。Mac版はアドホック署名で公証前です。iOS版の配布物はシミュレーター専用で、実機へのTestFlight配布はApple Developer登録後に追加します。
+
 ## 機能
 
 - ペン・鉛筆・消しゴム、サイズ、不透明度、硬さ、筆圧カーブ、手ぶれ補正。
@@ -56,9 +64,12 @@ iPhoneはApple Pencilに対応していません。ペンやペンタブの筆�
 ```sh
 swift test
 python3 scripts/check_repository.py
+python3 -m unittest discover -s Tests/AutomationTests
 ```
 
 GitHub Actionsでは、共通処理のテスト、macOSアプリのビルドとMetal描画の統合テスト、iOSアプリのビルド、iPhone・iPadシミュレーターの起動を行います。シミュレーター画像はActionsの成果物に保存します。Metalデバイスのない実行環境では、GPU統合テストはスキップされます。
+
+Release構成のMac配布ZIPも展開して起動します。`main`の両OSジョブが成功した場合に、GitHub Releasesへプレビューを自動公開します。
 
 筆圧、遅延、手ぶれ補正の感触、長時間のメモリ使用量は、実機と入力機器での確認が必要です。[実装状況と確認項目](docs/implementation.md)を参照してください。
 

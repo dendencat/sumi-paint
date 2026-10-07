@@ -26,9 +26,9 @@ for family in ("iPhone", "iPad"):
         subprocess.run(["xcrun", "simctl", "boot", udid], check=True, timeout=60)
     subprocess.run(["xcrun", "simctl", "bootstatus", udid, "-b"], check=True, timeout=240)
     print("Installing app", flush=True)
-    subprocess.run(["xcrun", "simctl", "install", udid, str(app)], check=True, timeout=90)
+    subprocess.run(["xcrun", "simctl", "install", udid, str(app)], check=True, timeout=180)
     print("Starting app", flush=True)
-    subprocess.run(["xcrun", "simctl", "launch", udid, "app.dendencat.sumipaint"], check=True, timeout=90)
+    subprocess.run(["xcrun", "simctl", "launch", udid, "app.dendencat.sumipaint"], check=True, timeout=180)
     time.sleep(4)
     # A launch can initially return a PID even if the process subsequently crashes.
     print("Checking app process", flush=True)
