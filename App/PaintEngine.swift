@@ -114,6 +114,7 @@ final class PaintEngine: ObservableObject {
     private let historyBudget = 64 * 1024 * 1024
     private var strokeSeed: Float = 0
     private var gpuWrittenTextures: [ObjectIdentifier: MTLTexture] = [:]
+    private var inFlightCommandBuffers: [MTLCommandBuffer] = []
 
     init() throws {
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue(),
@@ -177,18 +178,27 @@ final class PaintEngine: ObservableObject {
         composite = nextComposite; scratchA = nextA; scratchB = nextB; selectionTexture = nextSelection
     }
     private var fullRegion: MTLRegion { MTLRegionMake2D(0, 0, width, height) }
+    private func submit(_ command: MTLCommandBuffer) {
+        command.commit()
+        inFlightCommandBuffers.removeAll { $0.status == .completed || $0.status == .error }
+        inFlightCommandBuffers.append(command)
+    }
     private func waitForGPU() {
-        guard let barrier = queue.makeCommandBuffer() else { return }
+        // An empty command buffer is not a fence for actual drawing work.
+        // Wait for the commands that used the textures before reading or restoring them.
+        for command in inFlightCommandBuffers { command.waitUntilCompleted() }
+        inFlightCommandBuffers.removeAll()
         #if os(macOS)
         // Synchronizing a CPU-edited managed texture before a GPU read can overwrite
         // the restored pixels with the old GPU copy. Only synchronize actual GPU writes.
         let resources = Array(gpuWrittenTextures.values)
-        if resources.contains(where: { $0.storageMode == .managed }), let blit = barrier.makeBlitCommandEncoder() {
+        if resources.contains(where: { $0.storageMode == .managed }),
+           let barrier = queue.makeCommandBuffer(), let blit = barrier.makeBlitCommandEncoder() {
             for texture in resources where texture.storageMode == .managed { blit.synchronize(resource: texture) }
             blit.endEncoding()
+            barrier.commit(); barrier.waitUntilCompleted()
         }
         #endif
-        barrier.commit(); barrier.waitUntilCompleted()
         gpuWrittenTextures.removeAll()
     }
     private func read(_ texture: MTLTexture, region: MTLRegion? = nil) -> Data {
@@ -342,7 +352,7 @@ final class PaintEngine: ObservableObject {
         encoder.setVertexBytes(&size, length: MemoryLayout<SIMD2<Float>>.stride, index: 1)
         encoder.setFragmentBytes(&selected, length: 4, index: 0); encoder.setFragmentTexture(selectionTexture, index: 0)
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6, instanceCount: dabs.count)
-        encoder.endEncoding(); command.commit()
+        encoder.endEncoding(); submit(command)
         gpuWrittenTextures[ObjectIdentifier(layer.texture)] = layer.texture
         markDirty(bounds)
     }
@@ -385,7 +395,7 @@ final class PaintEngine: ObservableObject {
         guard let blit = command.makeBlitCommandEncoder() else { return }
         blit.copy(from: destination, sourceSlice: 0, sourceLevel: 0, sourceOrigin: region.origin, sourceSize: region.size,
                   to: composite, destinationSlice: 0, destinationLevel: 0, destinationOrigin: region.origin)
-        blit.endEncoding(); command.commit()
+        blit.endEncoding(); submit(command)
         gpuWrittenTextures[ObjectIdentifier(composite)] = composite
         dirty = nil
     }
@@ -401,7 +411,7 @@ final class PaintEngine: ObservableObject {
         encoder.setFragmentTexture(composite, index: 0); encoder.setFragmentTexture(selectionTexture, index: 1)
         encoder.setFragmentBytes(&settings, length: MemoryLayout<GPUView>.stride, index: 0)
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
-        encoder.endEncoding(); command.present(drawable); command.commit()
+        encoder.endEncoding(); command.present(drawable); submit(command)
     }
 
     private func commit() { revision &+= 1; onCommit?(); requestDisplay?() }
@@ -516,6 +526,7 @@ final class PaintEngine: ObservableObject {
         let oldMask = selectionMask, w = width, h = height
         Task {
             let result = await Task.detached(priority: .userInitiated) { operation(pixels, oldMask, w, h) }.value
+            waitForGPU()
             replace(layer.texture, data: Data(result.pixels))
             let after = allPatches(layer.texture)
             var changedBefore: [TilePatch] = [], changedAfter: [TilePatch] = []
