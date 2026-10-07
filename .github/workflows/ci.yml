@@ -1,0 +1,51 @@
+name: Native builds and tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2, MIT
+      - name: Verify generated project and repository
+        run: |
+          python3 scripts/check_repository.py
+          python3 scripts/generate_project.py
+          git diff --exit-code
+      - name: Test shared drawing algorithms
+        run: swift test
+      - name: Build and test native macOS app
+        run: >-
+          xcodebuild test -project SumiPaint.xcodeproj -scheme SumiPaint-macOS
+          -destination 'platform=macOS' -derivedDataPath build/macOS
+          -resultBundlePath build/macOS-results.xcresult CODE_SIGNING_ALLOWED=NO
+      - name: Upload macOS test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2, MIT
+        with:
+          name: macOS-test-results
+          path: build/macOS-results.xcresult
+          if-no-files-found: ignore
+  ios:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2, MIT
+      - name: Build iPhone and iPad app
+        run: >-
+          xcodebuild build -project SumiPaint.xcodeproj -scheme SumiPaint-iOS
+          -destination 'generic/platform=iOS Simulator' -derivedDataPath build/iOS
+          CODE_SIGNING_ALLOWED=NO
+      - name: Launch on iPhone and iPad simulators
+        run: python3 scripts/simulator_smoke.py 'build/iOS/Build/Products/Debug-iphonesimulator/Sumi Paint.app'
+      - name: Upload simulator screenshots
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2, MIT
+        with:
+          name: simulator-screenshots
+          path: build/screenshots/*.png
+          if-no-files-found: ignore

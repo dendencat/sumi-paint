@@ -1,0 +1,13 @@
+.build/
+.swiftpm/
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+*.xcresult/
+.DS_Store
+__pycache__/
+*.sumipaint
+*.log
+*.p12
+*.mobileprovision
