@@ -2,7 +2,21 @@ import SwiftUI
 
 private enum EditorPanel: String, Identifiable {
     case brush, color, layers, transform
+    #if os(macOS)
+    case tablet
+    #endif
     var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .brush: return "ブラシ"
+        case .color: return "色"
+        case .layers: return "レイヤー"
+        case .transform: return "選択範囲の変形"
+        #if os(macOS)
+        case .tablet: return "ペンタブのボタン"
+        #endif
+        }
+    }
 }
 
 struct EditorRoot: View {
@@ -39,10 +53,13 @@ struct EditorRoot: View {
                             case .color: ColorPanel(engine: engine)
                             case .layers: LayerPanel(engine: engine)
                             case .transform: TransformPanel(engine: engine, close: { panel = nil })
+                            #if os(macOS)
+                            case .tablet: MacTabletPanel()
+                            #endif
                             }
                         }.padding(20)
                     }
-                    .navigationTitle(value == .brush ? "ブラシ" : value == .color ? "色" : value == .layers ? "レイヤー" : "選択範囲の変形")
+                    .navigationTitle(value.title)
                     .toolbar { ToolbarItem(placement: .confirmationAction) { Button("閉じる") { panel = nil } } }
                 }
                 #if os(iOS)
@@ -148,6 +165,8 @@ private struct EditorWorkspace: View {
                 Toggle("左利き用の配置", isOn: $engine.leftHanded)
                 #if os(iOS)
                 Toggle("指で描く", isOn: $engine.fingerDrawing)
+                #else
+                Button("ペンタブのボタン設定", systemImage: "pencil.tip.crop.circle") { panel = .tablet }
                 #endif
                 Divider()
                 Button("すべて選択") { engine.selectAll() }

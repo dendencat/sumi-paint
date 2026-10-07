@@ -2,6 +2,42 @@ import XCTest
 @testable import DrawingCore
 
 final class DrawingCoreTests: XCTestCase {
+    func testHeldModesRestoreRemainingControlWhenReleasedOutOfOrder() {
+        var modes = InputModeStack(baseMode: "pencil")
+        modes.press("eraser-end", mode: "eraser")
+        modes.press("space", mode: "hand")
+        modes.release("eraser-end")
+        XCTAssertEqual(modes.currentMode, "hand")
+        modes.release("space")
+        XCTAssertEqual(modes.currentMode, "pencil")
+        XCTAssertFalse(modes.hasOverrides)
+    }
+    func testReleasingLastHeldModeRestoresPreviousHeldMode() {
+        var modes = InputModeStack(baseMode: "pen")
+        modes.press("right-button", mode: "eraser")
+        modes.press("middle-button", mode: "hand")
+        modes.release("middle-button")
+        XCTAssertEqual(modes.currentMode, "eraser")
+        modes.release("right-button")
+        XCTAssertEqual(modes.currentMode, "pen")
+    }
+    func testRepeatedPressDoesNotAccumulateOrReorderHeldModes() {
+        var modes = InputModeStack(baseMode: "pen")
+        modes.press("space", mode: "hand")
+        modes.press("option", mode: "eyedropper")
+        modes.press("space", mode: "hand")
+        XCTAssertEqual(modes.currentMode, "eyedropper")
+        modes.release("option"); modes.release("space")
+        XCTAssertEqual(modes.currentMode, "pen")
+    }
+    func testFocusResetCannotBeUndoneByLateButtonRelease() {
+        var modes = InputModeStack(baseMode: "pen")
+        modes.press("right-button", mode: "eraser")
+        modes.reset(to: "pencil")
+        modes.release("right-button")
+        XCTAssertEqual(modes.currentMode, "pencil")
+        XCTAssertFalse(modes.hasOverrides)
+    }
     func testStrokeSpacingDoesNotDependOnEventDensity() {
         var brush = BrushSettings(); brush.stabilization = 0; brush.size = 10; brush.spacing = 0.2
         func line(steps: Int) -> [BrushDab] {

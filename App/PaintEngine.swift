@@ -4,7 +4,7 @@ import MetalKit
 import ImageIO
 import UniformTypeIdentifiers
 
-enum EditorTool: String, CaseIterable {
+enum EditorTool: String, CaseIterable, Sendable {
     case pen, pencil, eraser, fill, eyedropper, rectangle, lasso, hand
     var title: String {
         switch self {
@@ -78,6 +78,8 @@ final class PaintEngine: ObservableObject {
     @Published var selectedLayerID: UUID?
     @Published var tool: EditorTool = .pen
     @Published var brush = BrushSettings()
+    private(set) var rememberedDrawingTool: EditorTool = .pen
+    private(set) var rememberedDrawingBrush = BrushSettings()
     @Published var color = PaintColor.ink
     @Published var recentColors: [PaintColor] = [.ink, .init(0.87, 0.29, 0.38), .init(0.26, 0.5, 0.8), .init(0.2, 0.65, 0.5)]
     @Published var viewport = CanvasViewport()
@@ -258,11 +260,17 @@ final class PaintEngine: ObservableObject {
         selectedLayerID = snapshot.selectedLayerID; documentID = snapshot.id
         brush = snapshot.brush; color = snapshot.color
         tool = brush.kind == .eraser ? .eraser : (brush.kind == .pencil ? .pencil : .pen)
+        rememberedDrawingTool = tool == .pencil ? .pencil : .pen
+        rememberedDrawingBrush = brush
+        rememberedDrawingBrush.kind = rememberedDrawingTool == .pencil ? .pencil : .pen
         resetEditingState(); commit()
     }
 
     func setTool(_ value: EditorTool) {
-        guard !strokeActive else { return }
+        guard !strokeActive, tool != value else { return }
+        if tool == .pen || tool == .pencil {
+            rememberedDrawingTool = tool; rememberedDrawingBrush = brush
+        }
         tool = value
         if value.isBrush {
             brush.kind = value == .eraser ? .eraser : (value == .pencil ? .pencil : .pen)

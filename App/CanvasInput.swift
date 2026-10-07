@@ -200,18 +200,65 @@ struct NativeCanvas: NSViewRepresentable {
 final class MouseCanvas: MTKView, MTKViewDelegate {
     let engine: PaintEngine
     let pointer: CanvasPointer
+    let toolInput: MacCanvasToolState
+    let tabletSettings: MacTabletSettings
     private var lastSize = CGSize.zero
-    private var spaceDown = false
+    private var pressedButtons: Set<Int> = []
+    private var buttonActions: [Int: TabletButtonAction] = [:]
+    private var proximityMonitor: Any?
+    private var eraserInProximity = false
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
-    init(engine: PaintEngine) {
-        self.engine = engine; pointer = CanvasPointer(engine: engine)
+    init(engine: PaintEngine, tabletSettings: MacTabletSettings? = nil) {
+        let pointer = CanvasPointer(engine: engine)
+        self.engine = engine; self.pointer = pointer
+        self.tabletSettings = tabletSettings ?? .shared
+        toolInput = MacCanvasToolState(engine: engine, pointer: pointer)
         super.init(frame: .zero, device: engine.device)
         colorPixelFormat = .bgra8Unorm; framebufferOnly = true
         isPaused = true; enableSetNeedsDisplay = true; delegate = self
         engine.requestDisplay = { [weak self] in self?.needsDisplay = true }
     }
     required init(coder: NSCoder) { fatalError("Interface Builder is not used") }
+    deinit {
+        if let proximityMonitor { NSEvent.removeMonitor(proximityMonitor) }
+        NotificationCenter.default.removeObserver(self)
+    }
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if let proximityMonitor { NSEvent.removeMonitor(proximityMonitor); self.proximityMonitor = nil }
+        NotificationCenter.default.removeObserver(self)
+        resetInput()
+        guard let window else { return }
+        NotificationCenter.default.addObserver(self, selector: #selector(windowLostFocus(_:)),
+            name: NSWindow.didResignKeyNotification, object: window)
+        NotificationCenter.default.addObserver(self, selector: #selector(windowGainedFocus(_:)),
+            name: NSWindow.didBecomeKeyNotification, object: window)
+        // Proximity can arrive before the canvas becomes first responder.
+        proximityMonitor = NSEvent.addLocalMonitorForEvents(matching: [.tabletProximity]) { [weak self] event in
+            guard let self else { return event }
+            self.eraserInProximity = event.isEnteringProximity && event.pointingDeviceType == .eraser
+            guard self.window?.isKeyWindow == true, self.window?.attachedSheet == nil else { return event }
+            self.updateTabletProximity(isEntering: event.isEnteringProximity, eraser: event.pointingDeviceType == .eraser)
+            return event
+        }
+    }
+    @objc private func windowLostFocus(_ notification: Notification) { resetInput() }
+    @objc private func windowGainedFocus(_ notification: Notification) { applyEraserProximity() }
+    private func resetInput() {
+        toolInput.reset(); pressedButtons = []; buttonActions = [:]
+    }
+    func updateTabletProximity(isEntering: Bool, eraser: Bool) {
+        eraserInProximity = isEntering && eraser
+        applyEraserProximity()
+    }
+    private func applyEraserProximity() {
+        if eraserInProximity && tabletSettings.automaticEraser {
+            toolInput.press("tablet-eraser", tool: .eraser)
+        } else {
+            toolInput.release("tablet-eraser")
+        }
+    }
     override func layout() {
         super.layout()
         guard bounds.size != lastSize else { return }
@@ -229,18 +276,77 @@ final class MouseCanvas: MTKView, MTKViewDelegate {
     private func pressure(_ event: NSEvent) -> Double? {
         event.subtype == .tabletPoint || event.type == .tabletPoint ? Double(event.pressure) : nil
     }
-    override func mouseDown(with event: NSEvent) {
-        window?.makeFirstResponder(self)
-        if event.modifierFlags.contains(.option) { engine.pickColor(at: engine.viewport.documentPoint(from: point(event))); return }
-        pointer.begin(point: point(event), time: event.timestamp, pressure: pressure(event), navigation: spaceDown)
+    private func synchronizeModifiers(_ event: NSEvent) {
+        if event.modifierFlags.contains(.option) {
+            toolInput.press("option", tool: .eyedropper)
+        } else {
+            toolInput.release("option")
+        }
     }
-    override func mouseDragged(with event: NSEvent) { pointer.move(point: point(event), time: event.timestamp, pressure: pressure(event)) }
+    private func beginPointer(_ event: NSEvent) {
+        pointer.begin(point: point(event), time: event.timestamp, pressure: pressure(event))
+    }
+    private func movePointer(_ event: NSEvent) {
+        // A mode change finishes the previous segment. Resume on motion instead of
+        // connecting distant drawing points across a pan or a color pick.
+        if pointer.start == nil && pressedButtons.contains(0) { beginPointer(event) }
+        pointer.move(point: point(event), time: event.timestamp, pressure: pressure(event))
+    }
+    override func mouseDown(with event: NSEvent) {
+        guard !engine.isBusy else { return }
+        window?.makeFirstResponder(self)
+        applyEraserProximity(); synchronizeModifiers(event); pressedButtons.insert(0)
+        pointer.end(); beginPointer(event)
+    }
+    override func mouseDragged(with event: NSEvent) { movePointer(event) }
     override func mouseUp(with event: NSEvent) {
         pointer.move(point: point(event), time: event.timestamp, pressure: pointer.lastPressure)
-        pointer.end()
+        pointer.end(); pressedButtons.remove(0)
     }
+    private func buttonDown(_ event: NSEvent) {
+        guard !engine.isBusy, pressedButtons.insert(event.buttonNumber).inserted else { return }
+        window?.makeFirstResponder(self)
+        applyEraserProximity()
+        let action = tabletSettings.action(for: event.buttonNumber)
+        buttonActions[event.buttonNumber] = action
+        if let tool = action.heldTool {
+            toolInput.press("button-\(event.buttonNumber)", tool: tool)
+            // Hovering with an eraser button must not leave a dot before tip contact.
+            if tool != .eraser || pressedButtons.contains(0) || pressure(event) == nil || event.pressure > 0 {
+                beginPointer(event)
+            }
+        } else {
+            switch action {
+            case .toggleEraser: pointer.end(); toolInput.toggleEraser()
+            case .undo: pointer.end(); engine.undo()
+            case .redo: pointer.end(); engine.redo()
+            default: break
+            }
+        }
+    }
+    private func buttonDragged(_ event: NSEvent) {
+        guard buttonActions[event.buttonNumber]?.heldTool != nil else { return }
+        if pointer.start == nil,
+           engine.tool != .eraser || pressedButtons.contains(0) || pressure(event) == nil || event.pressure > 0 {
+            beginPointer(event)
+        }
+        movePointer(event)
+    }
+    private func buttonUp(_ event: NSEvent) {
+        let action = buttonActions.removeValue(forKey: event.buttonNumber)
+        pressedButtons.remove(event.buttonNumber)
+        if action?.heldTool != nil {
+            pointer.end(); toolInput.release("button-\(event.buttonNumber)")
+        }
+    }
+    override func rightMouseDown(with event: NSEvent) { buttonDown(event) }
+    override func rightMouseDragged(with event: NSEvent) { buttonDragged(event) }
+    override func rightMouseUp(with event: NSEvent) { buttonUp(event) }
+    override func otherMouseDown(with event: NSEvent) { buttonDown(event) }
+    override func otherMouseDragged(with event: NSEvent) { buttonDragged(event) }
+    override func otherMouseUp(with event: NSEvent) { buttonUp(event) }
     override func tabletPoint(with event: NSEvent) {
-        if pointer.start != nil { pointer.move(point: point(event), time: event.timestamp, pressure: Double(event.pressure)) }
+        if pointer.start != nil || pressedButtons.contains(0) { movePointer(event) }
     }
     override func scrollWheel(with event: NSEvent) {
         guard !engine.strokeActive, !engine.isBusy else { return }
@@ -260,16 +366,27 @@ final class MouseCanvas: MTKView, MTKViewDelegate {
         engine.viewport.angle += Double(event.rotation) * .pi / 180; needsDisplay = true
     }
     override func keyDown(with event: NSEvent) {
-        if event.keyCode == 49 { spaceDown = true; return }
+        if !event.modifierFlags.intersection([.command, .control, .option]).isEmpty {
+            super.keyDown(with: event); return
+        }
+        if event.keyCode == 49 {
+            if !event.isARepeat { toolInput.press("space", tool: .hand) }
+            return
+        }
+        if event.keyCode == 53 { resetInput(); return }
         switch event.charactersIgnoringModifiers?.lowercased() {
-        case "b": engine.setTool(.pen); case "p": engine.setTool(.pencil); case "e": engine.setTool(.eraser)
-        case "g": engine.setTool(.fill); case "i": engine.setTool(.eyedropper); case "h": engine.setTool(.hand)
+        case "b": toolInput.select(.pen); case "p": toolInput.select(.pencil); case "e": toolInput.select(.eraser)
+        case "g": toolInput.select(.fill); case "i": toolInput.select(.eyedropper); case "h": toolInput.select(.hand)
+        case "x": if !event.isARepeat { toolInput.toggleEraser() }
         case "[": engine.brush.size = max(1, engine.brush.size - 2)
         case "]": engine.brush.size = min(512, engine.brush.size + 2)
         default: super.keyDown(with: event)
         }
     }
-    override func keyUp(with event: NSEvent) { if event.keyCode == 49 { spaceDown = false } else { super.keyUp(with: event) } }
-    override func resignFirstResponder() -> Bool { spaceDown = false; pointer.end(cancelled: true); return super.resignFirstResponder() }
+    override func keyUp(with event: NSEvent) {
+        if event.keyCode == 49 { toolInput.release("space") } else { super.keyUp(with: event) }
+    }
+    override func flagsChanged(with event: NSEvent) { synchronizeModifiers(event) }
+    override func resignFirstResponder() -> Bool { resetInput(); return super.resignFirstResponder() }
 }
 #endif

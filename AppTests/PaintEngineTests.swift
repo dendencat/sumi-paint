@@ -1,4 +1,5 @@
 import XCTest
+import AppKit
 import MetalKit
 import ImageIO
 @testable import SumiPaint
@@ -15,6 +16,82 @@ final class PaintEngineTests: XCTestCase {
     private func stroke(_ engine: PaintEngine, from: PaintPoint, to: PaintPoint) {
         engine.beginStroke(.init(point: from, time: 0, pressure: 1))
         engine.appendStroke(.init(point: to, time: 1, pressure: 1)); engine.endStroke()
+    }
+    private func tabletSettings() -> MacTabletSettings {
+        let suite = "SumiPaintTests.Tablet.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        return MacTabletSettings(defaults: defaults)
+    }
+    private func mouseEvent(_ type: NSEvent.EventType) throws -> NSEvent {
+        try XCTUnwrap(NSEvent.mouseEvent(with: type, location: .init(x: 32, y: 32),
+            modifierFlags: [], timestamp: 1, windowNumber: 0, context: nil, eventNumber: 1, clickCount: 1, pressure: 1))
+    }
+    private func keyEvent(_ text: String, code: UInt16, repeatKey: Bool = false) throws -> NSEvent {
+        try XCTUnwrap(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 1,
+            windowNumber: 0, context: nil, characters: text, charactersIgnoringModifiers: text,
+            isARepeat: repeatKey, keyCode: code))
+    }
+    func testMappedRightButtonRestoresCompleteBrushSettings() async throws {
+        let engine = try makeEngine()
+        engine.setTool(.pencil); engine.brush.hardness = 0.27; engine.brush.size = 29
+        let original = engine.brush
+        let settings = tabletSettings(); settings.rightAction = .holdEraser
+        let canvas = MouseCanvas(engine: engine, tabletSettings: settings)
+        canvas.rightMouseDown(with: try mouseEvent(.rightMouseDown))
+        XCTAssertEqual(engine.tool, .eraser); XCTAssertEqual(engine.brush.kind, .eraser)
+        canvas.rightMouseUp(with: try mouseEvent(.rightMouseUp))
+        XCTAssertEqual(engine.tool, .pencil); XCTAssertEqual(engine.brush, original)
+        XCTAssertFalse(engine.strokeActive)
+    }
+    func testEraserProximityDoesNotPaintAndRestoresOriginalTool() async throws {
+        let engine = try makeEngine()
+        engine.setTool(.pencil); engine.brush.hardness = 0.31
+        let original = engine.brush, pixels = engine.snapshot().layers[0].pixels
+        let canvas = MouseCanvas(engine: engine, tabletSettings: tabletSettings())
+        canvas.updateTabletProximity(isEntering: true, eraser: true)
+        XCTAssertEqual(engine.tool, .eraser); XCTAssertFalse(engine.strokeActive)
+        XCTAssertEqual(engine.snapshot().layers[0].pixels, pixels)
+        canvas.updateTabletProximity(isEntering: false, eraser: true)
+        XCTAssertEqual(engine.tool, .pencil); XCTAssertEqual(engine.brush, original)
+    }
+    func testToggleKeyPreservesPencilAndIgnoresKeyRepeat() async throws {
+        let engine = try makeEngine()
+        let canvas = MouseCanvas(engine: engine, tabletSettings: tabletSettings())
+        engine.setTool(.pencil); engine.brush.hardness = 0.22
+        let original = engine.brush
+        canvas.keyDown(with: try keyEvent("x", code: 7))
+        XCTAssertEqual(engine.tool, .eraser)
+        canvas.keyDown(with: try keyEvent("x", code: 7, repeatKey: true))
+        XCTAssertEqual(engine.tool, .eraser)
+        canvas.keyDown(with: try keyEvent("x", code: 7))
+        XCTAssertEqual(engine.tool, .pencil); XCTAssertEqual(engine.brush, original)
+    }
+    func testSpaceDuringStrokeCommitsInkAndFocusLossClearsMode() async throws {
+        let engine = try makeEngine()
+        engine.viewport.viewWidth = 64; engine.viewport.viewHeight = 64; engine.viewport.zoom = 1
+        let canvas = MouseCanvas(engine: engine, tabletSettings: tabletSettings())
+        canvas.pointer.begin(point: .init(32, 32), time: 0, pressure: 1)
+        XCTAssertTrue(engine.strokeActive)
+        let painted = engine.snapshot().layers[0].pixels
+        XCTAssertTrue(painted.contains { $0 != 0 })
+        canvas.keyDown(with: try keyEvent(" ", code: 49))
+        XCTAssertEqual(engine.tool, .hand); XCTAssertFalse(engine.strokeActive)
+        XCTAssertEqual(engine.snapshot().layers[0].pixels, painted)
+        _ = canvas.resignFirstResponder()
+        XCTAssertEqual(engine.tool, .pen); XCTAssertNil(canvas.pointer.start)
+        XCTAssertEqual(engine.snapshot().layers[0].pixels, painted)
+    }
+    func testTabletButtonPreferencesPersist() async throws {
+        let suite = "SumiPaintTests.Preferences.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = MacTabletSettings(defaults: defaults)
+        settings.rightAction = .toggleEraser; settings.middleAction = .holdEraser; settings.automaticEraser = false
+        let restored = MacTabletSettings(defaults: defaults)
+        XCTAssertEqual(restored.rightAction, .toggleEraser)
+        XCTAssertEqual(restored.middleAction, .holdEraser)
+        XCTAssertFalse(restored.automaticEraser)
     }
     func testPaintEraseAndUndoRestoreExactPixels() async throws {
         let engine = try makeEngine()
