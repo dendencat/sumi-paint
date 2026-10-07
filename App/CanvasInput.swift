@@ -303,14 +303,14 @@ final class MouseCanvas: MTKView, MTKViewDelegate {
         pointer.move(point: point(event), time: event.timestamp, pressure: pointer.lastPressure)
         pointer.end(); pressedButtons.remove(0)
     }
-    private func buttonDown(_ event: NSEvent) {
-        guard !engine.isBusy, pressedButtons.insert(event.buttonNumber).inserted else { return }
+    private func buttonDown(_ event: NSEvent, button: Int) {
+        guard !engine.isBusy, pressedButtons.insert(button).inserted else { return }
         window?.makeFirstResponder(self)
         applyEraserProximity()
-        let action = tabletSettings.action(for: event.buttonNumber)
-        buttonActions[event.buttonNumber] = action
+        let action = tabletSettings.action(for: button)
+        buttonActions[button] = action
         if let tool = action.heldTool {
-            toolInput.press("button-\(event.buttonNumber)", tool: tool)
+            toolInput.press("button-\(button)", tool: tool)
             // Hovering with an eraser button must not leave a dot before tip contact.
             if tool != .eraser || pressedButtons.contains(0) || pressure(event) == nil || event.pressure > 0 {
                 beginPointer(event)
@@ -324,27 +324,27 @@ final class MouseCanvas: MTKView, MTKViewDelegate {
             }
         }
     }
-    private func buttonDragged(_ event: NSEvent) {
-        guard buttonActions[event.buttonNumber]?.heldTool != nil else { return }
+    private func buttonDragged(_ event: NSEvent, button: Int) {
+        guard buttonActions[button]?.heldTool != nil else { return }
         if pointer.start == nil,
            engine.tool != .eraser || pressedButtons.contains(0) || pressure(event) == nil || event.pressure > 0 {
             beginPointer(event)
         }
         movePointer(event)
     }
-    private func buttonUp(_ event: NSEvent) {
-        let action = buttonActions.removeValue(forKey: event.buttonNumber)
-        pressedButtons.remove(event.buttonNumber)
+    private func buttonUp(_ event: NSEvent, button: Int) {
+        let action = buttonActions.removeValue(forKey: button)
+        pressedButtons.remove(button)
         if action?.heldTool != nil {
-            pointer.end(); toolInput.release("button-\(event.buttonNumber)")
+            pointer.end(); toolInput.release("button-\(button)")
         }
     }
-    override func rightMouseDown(with event: NSEvent) { buttonDown(event) }
-    override func rightMouseDragged(with event: NSEvent) { buttonDragged(event) }
-    override func rightMouseUp(with event: NSEvent) { buttonUp(event) }
-    override func otherMouseDown(with event: NSEvent) { buttonDown(event) }
-    override func otherMouseDragged(with event: NSEvent) { buttonDragged(event) }
-    override func otherMouseUp(with event: NSEvent) { buttonUp(event) }
+    override func rightMouseDown(with event: NSEvent) { buttonDown(event, button: 1) }
+    override func rightMouseDragged(with event: NSEvent) { buttonDragged(event, button: 1) }
+    override func rightMouseUp(with event: NSEvent) { buttonUp(event, button: 1) }
+    override func otherMouseDown(with event: NSEvent) { buttonDown(event, button: event.buttonNumber) }
+    override func otherMouseDragged(with event: NSEvent) { buttonDragged(event, button: event.buttonNumber) }
+    override func otherMouseUp(with event: NSEvent) { buttonUp(event, button: event.buttonNumber) }
     override func tabletPoint(with event: NSEvent) {
         if pointer.start != nil || pressedButtons.contains(0) { movePointer(event) }
     }

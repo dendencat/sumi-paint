@@ -44,6 +44,25 @@ final class PaintEngineTests: XCTestCase {
         XCTAssertEqual(engine.tool, .pencil); XCTAssertEqual(engine.brush, original)
         XCTAssertFalse(engine.strokeActive)
     }
+    func testMiddleButtonPansWithoutModifyingPixels() async throws {
+        let engine = try makeEngine()
+        let canvas = MouseCanvas(engine: engine, tabletSettings: tabletSettings())
+        let pixels = engine.snapshot().layers[0].pixels
+        func middleEvent(_ type: CGEventType, x: Double) throws -> NSEvent {
+            let cgEvent = try XCTUnwrap(CGEvent(mouseEventSource: nil, mouseType: type,
+                mouseCursorPosition: CGPoint(x: x, y: 32), mouseButton: .center))
+            cgEvent.setIntegerValueField(.mouseEventButtonNumber, value: 2)
+            return try XCTUnwrap(NSEvent(cgEvent: cgEvent))
+        }
+        canvas.otherMouseDown(with: try middleEvent(.otherMouseDown, x: 32))
+        XCTAssertEqual(engine.tool, .hand)
+        let before = engine.viewport.pan
+        canvas.otherMouseDragged(with: try middleEvent(.otherMouseDragged, x: 52))
+        XCTAssertNotEqual(engine.viewport.pan, before)
+        canvas.otherMouseUp(with: try middleEvent(.otherMouseUp, x: 52))
+        XCTAssertEqual(engine.tool, .pen)
+        XCTAssertEqual(engine.snapshot().layers[0].pixels, pixels)
+    }
     func testEraserProximityDoesNotPaintAndRestoresOriginalTool() async throws {
         let engine = try makeEngine()
         engine.setTool(.pencil); engine.brush.hardness = 0.31

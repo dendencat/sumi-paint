@@ -117,25 +117,30 @@ final class MacCanvasToolState {
 struct MacTabletPanel: View {
     @ObservedObject private var settings = MacTabletSettings.shared
     var body: some View {
-        Form {
-            Section("ペンボタン") {
+        VStack(alignment: .leading, spacing: 20) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("ペンボタン").font(.headline)
                 actionPicker("右クリックに割り当てたボタン", selection: $settings.rightAction)
                 actionPicker("中クリックに割り当てたボタン", selection: $settings.middleAction)
                 Text("Wacom CenterでSumi Paint用の設定を作り、ペンボタンに「右クリック」「中クリック」を割り当ててください。通常のマウスにも同じ操作が適用されます。")
                     .font(.caption).foregroundStyle(.secondary)
             }
-            Section("ペンの反転") {
+            Divider()
+            VStack(alignment: .leading, spacing: 12) {
+                Text("ペンの反転").font(.headline)
                 Toggle("消しゴム側で自動切り替え", isOn: $settings.automaticEraser)
                 Text("対応ペンが消しゴム側の入力を送ると切り替わり、戻すと元のツールとブラシ設定に戻ります。")
                     .font(.caption).foregroundStyle(.secondary)
             }
-            Section("キーを割り当てる場合") {
+            Divider()
+            VStack(alignment: .leading, spacing: 12) {
+                Text("キーを割り当てる場合").font(.headline)
                 Text("B: ペン　P: 鉛筆　E: 消しゴム　H: 移動\nX: 描画ツールと消しゴムを切り替え\nSpace: 押している間移動　Option: 押している間スポイト\nCommand-Z: 元に戻す　Command-Shift-Z: やり直す")
                     .font(.caption)
                 Text("文字入力中は文字入力を優先します。ボタンを使う前にキャンバスをクリックしてください。")
                     .font(.caption).foregroundStyle(.secondary)
             }
-        }.formStyle(.grouped)
+        }.frame(maxWidth: .infinity, alignment: .leading)
     }
     private func actionPicker(_ title: String, selection: Binding<TabletButtonAction>) -> some View {
         Picker(title, selection: selection) {

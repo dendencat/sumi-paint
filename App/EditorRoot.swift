@@ -65,7 +65,11 @@ struct EditorRoot: View {
                 #if os(iOS)
                 .presentationDetents([.medium, .large])
                 #endif
+                #if os(macOS)
+                .frame(minWidth: value == .tablet ? 480 : 300, minHeight: value == .tablet ? 480 : 360)
+                #else
                 .frame(minWidth: 300, minHeight: 360)
+                #endif
             }
         }
         .alert("前回の作業が見つかりました", isPresented: Binding(
