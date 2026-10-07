@@ -1,4 +1,9 @@
 import SwiftUI
+#if os(iOS)
+import UIKit
+#else
+import AppKit
+#endif
 
 struct BrushPanel: View {
     @ObservedObject var engine: PaintEngine

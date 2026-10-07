@@ -45,7 +45,9 @@ struct EditorRoot: View {
                     .navigationTitle(value == .brush ? "ブラシ" : value == .color ? "色" : value == .layers ? "レイヤー" : "選択範囲の変形")
                     .toolbar { ToolbarItem(placement: .confirmationAction) { Button("閉じる") { panel = nil } } }
                 }
+                #if os(iOS)
                 .presentationDetents([.medium, .large])
+                #endif
                 .frame(minWidth: 300, minHeight: 360)
             }
         }

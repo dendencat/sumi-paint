@@ -1,5 +1,8 @@
 import SwiftUI
 import UniformTypeIdentifiers
+#if os(iOS)
+import UIKit
+#endif
 
 extension UTType {
     static let sumiPainting = UTType(exportedAs: "app.dendencat.sumipaint.document", conformingTo: .data)

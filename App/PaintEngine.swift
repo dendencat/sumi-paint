@@ -252,8 +252,10 @@ final class PaintEngine: ObservableObject {
         }
     }
     func setColor(_ value: PaintColor) {
-        color = value
-        recentColors.removeAll { $0 == value }; recentColors.insert(value, at: 0)
+        guard [value.red, value.green, value.blue, value.alpha].allSatisfy(\.isFinite) else { return }
+        let clamped = PaintColor(min(1, max(0, value.red)), min(1, max(0, value.green)), min(1, max(0, value.blue)), min(1, max(0, value.alpha)))
+        color = clamped
+        recentColors.removeAll { $0 == clamped }; recentColors.insert(clamped, at: 0)
         if recentColors.count > 8 { recentColors.removeLast() }
     }
     func beginStroke(_ sample: StrokeSample) {
@@ -581,7 +583,7 @@ final class PaintEngine: ObservableObject {
             throw PaintDocumentError.invalid("PNGを生成できません。")
         }
         let output = NSMutableData()
-        guard let destination = CGImageDestinationCreateWithData(output, UTType.png.identifier as CFString, 1, nil) else {
+        guard let destination = CGImageDestinationCreateWithData(output as CFMutableData, UTType.png.identifier as CFString, 1, nil) else {
             throw PaintDocumentError.invalid("PNGを生成できません。")
         }
         CGImageDestinationAddImage(destination, image, nil)
