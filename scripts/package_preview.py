@@ -49,7 +49,7 @@ def package(platform, app):
         "bundle_identifier": info["CFBundleIdentifier"], "version": info["CFBundleShortVersionString"],
         "build_number": info["CFBundleVersion"],
         "minimum_os": info.get("LSMinimumSystemVersion", info.get("MinimumOSVersion")),
-        "signing": "ad-hoc; not notarized" if platform == "macOS" else "simulator only",
+        "signing": "ad-hoc; hardened runtime; not notarized" if platform == "macOS" else "simulator only",
         "workflow_run": os.environ.get("GITHUB_RUN_ID"),
     }
     (stage / "build-info.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n")

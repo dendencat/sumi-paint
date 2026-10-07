@@ -38,7 +38,7 @@ jobs:
       - name: Sign and verify local macOS preview
         run: |
           app='build/macOS-preview/Build/Products/Release/Sumi Paint.app'
-          codesign --force --sign - --entitlements App/macOS.entitlements "$app"
+          codesign --force --sign - --options runtime --entitlements App/macOS.entitlements "$app"
           codesign --verify --deep --strict "$app"
           python3 scripts/package_preview.py macOS "$app"
           ditto -x -k build/preview/SumiPaint-macOS-Preview.zip build/preview-check

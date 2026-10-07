@@ -1,0 +1,68 @@
+[
+  {
+    "fixture": "oversized-eight.sumipaint",
+    "data_segment_limit_mib": 64,
+    "exit_code": 0,
+    "decode_seconds": 0.004929184913635254,
+    "file": "oversized-eight.sumipaint",
+    "input_bytes": 16778616,
+    "peak_after_kib": 34620,
+    "peak_before_kib": 33444,
+    "result": "rejected: 作品を開けません: 作品の構造またはデータ量が不正です。"
+  },
+  {
+    "fixture": "repeated-250000-layers-4-bytes.sumipaint",
+    "data_segment_limit_mib": 64,
+    "exit_code": 0,
+    "decode_seconds": 0.002065896987915039,
+    "file": "repeated-250000-layers-4-bytes.sumipaint",
+    "input_bytes": 250800,
+    "peak_after_kib": 18468,
+    "peak_before_kib": 17300,
+    "result": "rejected: 作品を開けません: 作品の構造またはデータ量が不正です。"
+  },
+  {
+    "fixture": "repeated-64-layers-1048576-bytes.sumipaint",
+    "data_segment_limit_mib": 64,
+    "exit_code": 0,
+    "decode_seconds": 0.0021047592163085938,
+    "file": "repeated-64-layers-1048576-bytes.sumipaint",
+    "input_bytes": 1049438,
+    "peak_after_kib": 19376,
+    "peak_before_kib": 18464,
+    "result": "rejected: 作品を開けません: 作品の構造またはデータ量が不正です。"
+  },
+  {
+    "fixture": "repeated-9-layers-1024-bytes.sumipaint",
+    "data_segment_limit_mib": 64,
+    "exit_code": 0,
+    "decode_seconds": 0.001556992530822754,
+    "file": "repeated-9-layers-1024-bytes.sumipaint",
+    "input_bytes": 1715,
+    "peak_after_kib": 18228,
+    "peak_before_kib": 17060,
+    "result": "rejected: 作品を開けません: 作品の構造またはデータ量が不正です。"
+  },
+  {
+    "fixture": "seed.sumipaint",
+    "data_segment_limit_mib": 64,
+    "exit_code": 0,
+    "decode_seconds": 0.0021897554397583008,
+    "file": "seed.sumipaint",
+    "input_bytes": 1707,
+    "peak_after_kib": 18508,
+    "peak_before_kib": 17072,
+    "result": "accepted, layers=1"
+  },
+  {
+    "fixture": "valid-eight.sumipaint",
+    "data_segment_limit_mib": 64,
+    "exit_code": 0,
+    "decode_seconds": 0.05864763259887695,
+    "file": "valid-eight.sumipaint",
+    "input_bytes": 4195704,
+    "peak_after_kib": 55616,
+    "peak_before_kib": 21536,
+    "result": "accepted, layers=8"
+  }
+]

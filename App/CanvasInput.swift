@@ -50,6 +50,7 @@ final class CanvasPointer {
         }
         start = nil; polygon = []; moving = false; lastViewPoint = nil; lastPressure = nil; onPath?([])
     }
+    func undoIncludingStroke() { end(); engine.undo() }
 }
 
 struct PaintCanvas: View {
@@ -137,22 +138,22 @@ final class TouchCanvas: MTKView, MTKViewDelegate, UIGestureRecognizerDelegate {
         !(recognizer is UITapGestureRecognizer) && !(other is UITapGestureRecognizer)
     }
     @objc private func pan(_ recognizer: UIPanGestureRecognizer) {
-        if recognizer.state == .began { pointer.end(cancelled: true); activeTouch = nil }
+        if recognizer.state == .began { pointer.end(); activeTouch = nil }
         let translation = recognizer.translation(in: self)
         engine.viewport.pan.x += Double(translation.x); engine.viewport.pan.y += Double(translation.y)
         recognizer.setTranslation(.zero, in: self); setNeedsDisplay()
     }
     @objc private func pinch(_ recognizer: UIPinchGestureRecognizer) {
-        if recognizer.state == .began { pointer.end(cancelled: true); activeTouch = nil }
+        if recognizer.state == .began { pointer.end(); activeTouch = nil }
         let anchor = recognizer.location(in: self)
         engine.viewport.zoom(by: Double(recognizer.scale), around: .init(Double(anchor.x), Double(anchor.y)))
         recognizer.scale = 1; setNeedsDisplay()
     }
     @objc private func rotate(_ recognizer: UIRotationGestureRecognizer) {
-        if recognizer.state == .began { pointer.end(cancelled: true); activeTouch = nil }
+        if recognizer.state == .began { pointer.end(); activeTouch = nil }
         engine.viewport.angle += Double(recognizer.rotation); recognizer.rotation = 0; setNeedsDisplay()
     }
-    @objc private func twoFingerTap() { pointer.end(cancelled: true); activeTouch = nil; engine.undo() }
+    @objc private func twoFingerTap() { pointer.undoIncludingStroke(); activeTouch = nil }
     private func pressure(_ touch: UITouch) -> Double? {
         guard touch.type == .pencil, touch.maximumPossibleForce > 0, touch.force > 0 else { return nil }
         return min(1, Double(touch.force / touch.maximumPossibleForce))
@@ -181,7 +182,8 @@ final class TouchCanvas: MTKView, MTKViewDelegate, UIGestureRecognizerDelegate {
     }
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let touch = activeTouch, touches.contains(touch) else { return }
-        pointer.end(cancelled: true); activeTouch = nil
+        // UIKit cancels touches when a gesture claims them. Preserve the ink as an undoable edit.
+        pointer.end(); activeTouch = nil
     }
 }
 #else

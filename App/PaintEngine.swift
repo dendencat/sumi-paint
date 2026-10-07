@@ -97,6 +97,15 @@ final class PaintEngine: ObservableObject {
     @Published private(set) var height = 1024
     var documentID = UUID()
     var onCommit: (() -> Void)?
+    var onContentChange: (() -> Void)?
+    private(set) var contentRevision: UInt64 = 0
+    private(set) var gpuFailure: String?
+    private var cancellationPending = false
+    var hasPendingCancellation: Bool { cancellationPending }
+    #if DEBUG
+    var failNextPatchAllocation = false
+    var failNextGPUCompletion = false
+    #endif
     var requestDisplay: (() -> Void)?
     var strokeActive: Bool { processor != nil }
     var selectedLayer: PaintLayer? { layers.first { $0.id == selectedLayerID } }
@@ -180,28 +189,54 @@ final class PaintEngine: ObservableObject {
         composite = nextComposite; scratchA = nextA; scratchB = nextB; selectionTexture = nextSelection
     }
     private var fullRegion: MTLRegion { MTLRegionMake2D(0, 0, width, height) }
-    private func submit(_ command: MTLCommandBuffer) {
+    private func checkCompletion(_ command: MTLCommandBuffer) {
+        if command.status == .error {
+            failGPU("GPU処理が失敗しました: \(command.error?.localizedDescription ?? "不明なエラー")")
+        }
+    }
+    private func failGPU(_ message: String) {
+        if gpuFailure == nil {
+            gpuFailure = message; dirty = fullRegion
+            errorMessage = message + " 最新の保存を確認してアプリを再起動してください。"
+        }
+    }
+    @discardableResult
+    private func submit(_ command: MTLCommandBuffer) -> Bool {
+        for previous in inFlightCommandBuffers where previous.status == .completed || previous.status == .error {
+            checkCompletion(previous)
+        }
+        guard gpuFailure == nil else { return false }
         command.commit()
         inFlightCommandBuffers.removeAll { $0.status == .completed || $0.status == .error }
         inFlightCommandBuffers.append(command)
+        return true
     }
-    private func waitForGPU() {
+    @discardableResult
+    private func waitForGPU() -> Bool {
         // An empty command buffer is not a fence for actual drawing work.
         // Wait for the commands that used the textures before reading or restoring them.
-        for command in inFlightCommandBuffers { command.waitUntilCompleted() }
+        for command in inFlightCommandBuffers { command.waitUntilCompleted(); checkCompletion(command) }
         inFlightCommandBuffers.removeAll()
+        #if DEBUG
+        if failNextGPUCompletion { failNextGPUCompletion = false; failGPU("検証用GPU実行エラー") }
+        #endif
+        guard gpuFailure == nil else { return false }
         #if os(macOS)
         // Synchronizing a CPU-edited managed texture before a GPU read can overwrite
         // the restored pixels with the old GPU copy. Only synchronize actual GPU writes.
         let resources = Array(gpuWrittenTextures.values)
-        if resources.contains(where: { $0.storageMode == .managed }),
-           let barrier = queue.makeCommandBuffer(), let blit = barrier.makeBlitCommandEncoder() {
+        if resources.contains(where: { $0.storageMode == .managed }) {
+            guard let barrier = queue.makeCommandBuffer(), let blit = barrier.makeBlitCommandEncoder() else {
+                failGPU("GPUと保存画像を同期できません。"); return false
+            }
             for texture in resources where texture.storageMode == .managed { blit.synchronize(resource: texture) }
             blit.endEncoding()
             barrier.commit(); barrier.waitUntilCompleted()
+            checkCompletion(barrier)
         }
         #endif
         gpuWrittenTextures.removeAll()
+        return gpuFailure == nil
     }
     private func read(_ texture: MTLTexture, region: MTLRegion? = nil) -> Data {
         let region = region ?? fullRegion
@@ -219,7 +254,7 @@ final class PaintEngine: ObservableObject {
         guard !strokeActive, !isBusy, (64...2048).contains(width), (64...2048).contains(height) else {
             throw PaintDocumentError.invalid("サイズは64〜2048ピクセルにしてください。")
         }
-        waitForGPU()
+        guard waitForGPU() else { throw PaintDocumentError.invalid(gpuFailure!) }
         // Allocate in a temporary engine state; loading uses the same rollback-safe path.
         let previousWidth = self.width, previousHeight = self.height
         self.width = width; self.height = height
@@ -231,13 +266,14 @@ final class PaintEngine: ObservableObject {
         documentID = UUID(); resetEditingState(); commit()
     }
     private func resetEditingState() {
+        cancellationPending = false
         undoRecords = []; redoRecords = []; canUndo = false; canRedo = false
         selectionMask = nil; hasSelection = false; processor = nil; strokeLayer = nil; beforeTiles = [:]
         viewport.canvasWidth = Double(width); viewport.canvasHeight = Double(height); viewport.fit()
         markDirty(fullRegion)
     }
-    func snapshot() -> DocumentSnapshot {
-        waitForGPU()
+    func snapshot() throws -> DocumentSnapshot {
+        guard waitForGPU() else { throw PaintDocumentError.invalid(gpuFailure!) }
         var document = DocumentSnapshot(width: width, height: height,
             layers: layers.map { .init(properties: $0.properties, pixels: read($0.texture)) },
             selectedLayerID: selectedLayerID ?? layers[0].id)
@@ -246,7 +282,8 @@ final class PaintEngine: ObservableObject {
     }
     func load(_ snapshot: DocumentSnapshot) throws {
         guard !strokeActive, !isBusy else { return }
-        try snapshot.validate(); waitForGPU()
+        try snapshot.validate()
+        guard waitForGPU() else { throw PaintDocumentError.invalid(gpuFailure!) }
         let oldWidth = width, oldHeight = height
         width = snapshot.width; height = snapshot.height
         do {
@@ -285,7 +322,7 @@ final class PaintEngine: ObservableObject {
         if recentColors.count > 8 { recentColors.removeLast() }
     }
     func beginStroke(_ sample: StrokeSample) {
-        guard !isBusy, !strokeActive, tool.isBrush, let layer = editableLayer() else { return }
+        guard gpuFailure == nil, !isBusy, !strokeActive, tool.isBrush, let layer = editableLayer() else { return }
         if tool == .eraser && layer.properties.alphaLocked { return }
         strokeBrush = brush; strokeColor = color; strokeLayer = layer; beforeTiles = [:]
         strokeSeed = Float.random(in: 0...10000)
@@ -293,23 +330,28 @@ final class PaintEngine: ObservableObject {
         if let values = processor?.append(sample) { drawDabs(values, layer: layer) }
     }
     func appendStroke(_ sample: StrokeSample) {
-        guard let layer = strokeLayer, let values = processor?.append(sample) else { return }
+        guard gpuFailure == nil, !cancellationPending, let layer = strokeLayer, let values = processor?.append(sample) else { return }
         drawDabs(values, layer: layer)
     }
     func endStroke(cancelled: Bool = false) {
         guard let layer = strokeLayer else { return }
-        if !cancelled, let tail = processor?.finish() { drawDabs(tail, layer: layer) }
-        waitForGPU()
+        let shouldCancel = cancelled || cancellationPending
+        if !shouldCancel, let tail = processor?.finish() { drawDabs(tail, layer: layer) }
+        guard waitForGPU() else { processor = nil; strokeLayer = nil; return }
         let before = beforeTiles.values.sorted { $0.key < $1.key }
-        if cancelled {
-            applyPatches(before, to: layer); markDirty(fullRegion)
+        if shouldCancel {
+            guard applyPatches(before, to: layer) else { cancellationPending = true; return }
+            markDirty(fullRegion)
         } else if !before.isEmpty {
             let after = before.map { tile in patch(layer.texture, x: tile.x, y: tile.y, width: tile.width, height: tile.height) }
             record(.pixels(layer.id, before, after, nil, nil)); commit()
         }
+        cancellationPending = false
         processor = nil; strokeLayer = nil; beforeTiles = [:]; requestDisplay?()
     }
+    func retryPendingCancellation() { if cancellationPending { endStroke(cancelled: true) } }
     private func editableLayer() -> PaintLayer? {
+        guard gpuFailure == nil else { return nil }
         guard let layer = selectedLayer else { return nil }
         if layer.properties.locked || !layer.properties.visible {
             errorMessage = "描画するにはレイヤーを表示し、ロックを解除してください。"; return nil
@@ -328,7 +370,7 @@ final class PaintEngine: ObservableObject {
             }
         }
         guard !missing.isEmpty else { return }
-        waitForGPU()
+        guard waitForGPU() else { return }
         for (x, y) in missing {
             let tile = patch(layer.texture, x: x, y: y, width: min(128, width - x), height: min(128, height - y))
             beforeTiles[tile.key] = tile
@@ -343,6 +385,7 @@ final class PaintEngine: ObservableObject {
         guard lowX < highX, lowY < highY else { return }
         let bounds = MTLRegionMake2D(lowX, lowY, highX - lowX, highY - lowY)
         captureTiles(for: bounds, layer: layer)
+        guard gpuFailure == nil else { return }
         let dabs = values.map { value in
             GPUDab(point: .init(Float(value.point.x), Float(value.point.y)), radius: Float(value.radius),
                 opacity: Float(value.opacity), color: .init(Float(strokeColor.red), Float(strokeColor.green), Float(strokeColor.blue), Float(strokeColor.alpha)),
@@ -360,7 +403,8 @@ final class PaintEngine: ObservableObject {
         encoder.setVertexBytes(&size, length: MemoryLayout<SIMD2<Float>>.stride, index: 1)
         encoder.setFragmentBytes(&selected, length: 4, index: 0); encoder.setFragmentTexture(selectionTexture, index: 0)
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6, instanceCount: dabs.count)
-        encoder.endEncoding(); submit(command)
+        encoder.endEncoding()
+        guard submit(command) else { return }
         gpuWrittenTextures[ObjectIdentifier(layer.texture)] = layer.texture
         markDirty(bounds)
     }
@@ -372,14 +416,14 @@ final class PaintEngine: ObservableObject {
             let bottom = max(previous.origin.y + previous.size.height, region.origin.y + region.size.height)
             dirty = MTLRegionMake2D(x, y, right - x, bottom - y)
         } else { dirty = region }
-        requestDisplay?()
+        contentRevision &+= 1; onContentChange?(); requestDisplay?()
     }
     private func dispatch(_ encoder: MTLComputeCommandEncoder, pipeline: MTLComputePipelineState, region: MTLRegion) {
         encoder.dispatchThreads(.init(width: region.size.width, height: region.size.height, depth: 1),
             threadsPerThreadgroup: .init(width: 8, height: 8, depth: 1))
     }
     func updateComposite() {
-        guard let region = dirty, let command = queue.makeCommandBuffer() else { return }
+        guard gpuFailure == nil, let region = dirty, let command = queue.makeCommandBuffer() else { return }
         var origin = SIMD2<UInt32>(UInt32(region.origin.x), UInt32(region.origin.y))
         guard let clear = command.makeComputeCommandEncoder() else { return }
         clear.setComputePipelineState(clearPipeline); clear.setTexture(scratchA, index: 0)
@@ -403,11 +447,13 @@ final class PaintEngine: ObservableObject {
         guard let blit = command.makeBlitCommandEncoder() else { return }
         blit.copy(from: destination, sourceSlice: 0, sourceLevel: 0, sourceOrigin: region.origin, sourceSize: region.size,
                   to: composite, destinationSlice: 0, destinationLevel: 0, destinationOrigin: region.origin)
-        blit.endEncoding(); submit(command)
+        blit.endEncoding()
+        guard submit(command) else { return }
         gpuWrittenTextures[ObjectIdentifier(composite)] = composite
         dirty = nil
     }
     func render(in view: MTKView) {
+        guard gpuFailure == nil else { return }
         updateComposite()
         guard let drawable = view.currentDrawable, let pass = view.currentRenderPassDescriptor,
               let command = queue.makeCommandBuffer(), let encoder = command.makeRenderCommandEncoder(descriptor: pass) else { return }
@@ -428,15 +474,21 @@ final class PaintEngine: ObservableObject {
         while undoRecords.reduce(0, { $0 + $1.byteCost }) > historyBudget || undoRecords.count > 100 { undoRecords.removeFirst() }
         canUndo = !undoRecords.isEmpty; canRedo = false
     }
-    private func applyPatches(_ patches: [TilePatch], to layer: PaintLayer) {
-        guard !patches.isEmpty else { return }
+    private func applyPatches(_ patches: [TilePatch], to layer: PaintLayer) -> Bool {
+        guard gpuFailure == nil else { return false }
+        guard !patches.isEmpty else { return true }
+        #if DEBUG
+        if failNextPatchAllocation {
+            failNextPatchAllocation = false; errorMessage = "検証用の画像復元メモリ不足"; return false
+        }
+        #endif
         // Restore through the same GPU queue as painting. CPU replace calls on a
         // recently rendered shared texture can race with the driver's optimized copy.
         var uploads: [(TilePatch, MTLBuffer, Int)] = []
         for tile in patches {
             let rowBytes = (tile.width * 4 + 255) / 256 * 256
             guard let buffer = device.makeBuffer(length: rowBytes * tile.height, options: .storageModeShared) else {
-                errorMessage = "画像を復元するメモリが不足しています。"; return
+                errorMessage = "画像を復元するメモリが不足しています。"; return false
             }
             tile.data.withUnsafeBytes { bytes in
                 for row in 0..<tile.height {
@@ -447,24 +499,25 @@ final class PaintEngine: ObservableObject {
             uploads.append((tile, buffer, rowBytes))
         }
         guard let command = queue.makeCommandBuffer(), let blit = command.makeBlitCommandEncoder() else {
-            errorMessage = "画像を復元できません。"; return
+            errorMessage = "画像を復元できません。"; return false
         }
         for (tile, buffer, rowBytes) in uploads {
             blit.copy(from: buffer, sourceOffset: 0, sourceBytesPerRow: rowBytes, sourceBytesPerImage: rowBytes * tile.height,
                 sourceSize: .init(width: tile.width, height: tile.height, depth: 1),
                 to: layer.texture, destinationSlice: 0, destinationLevel: 0, destinationOrigin: .init(x: tile.x, y: tile.y, z: 0))
         }
-        blit.endEncoding(); submit(command)
+        blit.endEncoding()
+        guard submit(command) else { return false }
         gpuWrittenTextures[ObjectIdentifier(layer.texture)] = layer.texture
+        return waitForGPU()
     }
-    private func apply(_ record: EditRecord, forward: Bool) {
+    private func apply(_ record: EditRecord, forward: Bool) -> Bool {
         switch record {
         case .pixels(let id, let before, let after, let oldMask, let newMask):
-            if let layer = layers.first(where: { $0.id == id }) {
-                applyPatches(forward ? after : before, to: layer)
-                if oldMask != nil || newMask != nil { setSelectionMask(forward ? newMask : oldMask) }
-                selectedLayerID = id
-            }
+            guard let layer = layers.first(where: { $0.id == id }),
+                  applyPatches(forward ? after : before, to: layer) else { return false }
+            if oldMask != nil || newMask != nil { setSelectionMask(forward ? newMask : oldMask) }
+            selectedLayerID = id
         case .insert(let layer, let index):
             if forward { layers.insert(layer, at: min(index, layers.count)); selectedLayerID = layer.id }
             else { layers.removeAll { $0.id == layer.id } }
@@ -479,22 +532,25 @@ final class PaintEngine: ObservableObject {
         }
         if !layers.contains(where: { $0.id == selectedLayerID }) { selectedLayerID = layers.last?.id }
         objectWillChange.send(); markDirty(fullRegion); commit()
+        return true
     }
     func undo() {
-        guard !strokeActive, !isBusy, let record = undoRecords.popLast() else { return }
-        waitForGPU(); apply(record, forward: false); redoRecords.append(record)
+        guard !strokeActive, !isBusy, let record = undoRecords.last,
+              waitForGPU(), apply(record, forward: false) else { return }
+        undoRecords.removeLast(); redoRecords.append(record)
         canUndo = !undoRecords.isEmpty; canRedo = true
     }
     func redo() {
-        guard !strokeActive, !isBusy, let record = redoRecords.popLast() else { return }
-        waitForGPU(); apply(record, forward: true); undoRecords.append(record)
+        guard !strokeActive, !isBusy, let record = redoRecords.last,
+              waitForGPU(), apply(record, forward: true) else { return }
+        redoRecords.removeLast(); undoRecords.append(record)
         canUndo = true; canRedo = !redoRecords.isEmpty
     }
     func addLayer(duplicate: Bool = false) {
         guard !strokeActive, !isBusy else { return }
         guard layers.count < DocumentSnapshot.maximumLayers else { errorMessage = "初期版のレイヤー上限は8枚です。"; return }
         do {
-            waitForGPU()
+            guard waitForGPU() else { return }
             let texture = try transparentTexture()
             var properties = LayerProperties(name: "レイヤー\(layers.count + 1)")
             if duplicate, let selected = selectedLayer {
@@ -508,19 +564,22 @@ final class PaintEngine: ObservableObject {
         } catch { errorMessage = error.localizedDescription }
     }
     func deleteLayer() {
-        guard !strokeActive, !isBusy, layers.count > 1, let index = layers.firstIndex(where: { $0.id == selectedLayerID }) else { return }
+        guard gpuFailure == nil, !strokeActive, !isBusy, layers.count > 1, let index = layers.firstIndex(where: { $0.id == selectedLayerID }) else { return }
         let removed = layers.remove(at: index); selectedLayerID = layers[min(index, layers.count - 1)].id
         record(.remove(removed, index)); markDirty(fullRegion); commit()
     }
     func moveLayer(_ direction: Int) {
-        guard !strokeActive, !isBusy, let index = layers.firstIndex(where: { $0.id == selectedLayerID }),
+        guard gpuFailure == nil, !strokeActive, !isBusy, let index = layers.firstIndex(where: { $0.id == selectedLayerID }),
               layers.indices.contains(index + direction) else { return }
         let before = layers.map(\.id); layers.swapAt(index, index + direction)
         record(.reorder(before, layers.map(\.id))); markDirty(fullRegion); commit()
     }
     func changeLayer(_ id: UUID, _ change: (inout LayerProperties) -> Void) {
-        guard !strokeActive, !isBusy, let layer = layers.first(where: { $0.id == id }) else { return }
+        guard gpuFailure == nil, !strokeActive, !isBusy, let layer = layers.first(where: { $0.id == id }) else { return }
         let before = layer.properties; var after = before; change(&after)
+        guard after.name.utf8.count <= 64 * 1024, after.opacity.isFinite, (0...1).contains(after.opacity) else {
+            errorMessage = "レイヤーの設定または名前が不正です。"; return
+        }
         after.name = String(after.name.prefix(256))
         guard before != after else { return }
         layer.properties = after; record(.properties(id, before, after)); objectWillChange.send()
@@ -528,7 +587,8 @@ final class PaintEngine: ObservableObject {
     }
 
     private func setSelectionMask(_ mask: [UInt8]?) {
-        waitForGPU(); selectionMask = mask; hasSelection = mask?.contains(where: { $0 != 0 }) == true
+        guard waitForGPU() else { return }
+        selectionMask = mask; hasSelection = mask?.contains(where: { $0 != 0 }) == true
         let values = mask ?? [UInt8](repeating: 0, count: width * height)
         values.withUnsafeBytes { selectionTexture.replace(region: fullRegion, mipmapLevel: 0, withBytes: $0.baseAddress!, bytesPerRow: width) }
         requestDisplay?()
@@ -541,7 +601,7 @@ final class PaintEngine: ObservableObject {
     func selectAll() { guard !strokeActive, !isBusy else { return }; setSelectionMask([UInt8](repeating: 255, count: width * height)) }
     func pickColor(at point: PaintPoint) {
         guard !isBusy, (0..<Double(width)).contains(point.x), (0..<Double(height)).contains(point.y) else { return }
-        updateComposite(); waitForGPU()
+        updateComposite(); guard waitForGPU(), dirty == nil else { return }
         let data = [UInt8](read(composite, region: MTLRegionMake2D(Int(point.x), Int(point.y), 1, 1)))
         let alpha = Double(data[3]) / 255
         if alpha > 0 { setColor(.init(Double(data[0]) / 255 / alpha, Double(data[1]) / 255 / alpha, Double(data[2]) / 255 / alpha)) }
@@ -555,12 +615,13 @@ final class PaintEngine: ObservableObject {
     }
     private func rasterEdit(_ operation: @escaping @Sendable ([UInt8], [UInt8]?, Int, Int) -> (pixels: [UInt8], mask: [UInt8]?)) {
         guard !isBusy, !strokeActive, let layer = editableLayer() else { return }
-        waitForGPU(); isBusy = true
+        guard waitForGPU() else { return }; isBusy = true
         let before = allPatches(layer.texture), pixels = [UInt8](read(layer.texture))
         let oldMask = selectionMask, w = width, h = height
         Task {
+            defer { isBusy = false }
             let result = await Task.detached(priority: .userInitiated) { operation(pixels, oldMask, w, h) }.value
-            waitForGPU()
+            guard waitForGPU() else { return }
             replace(layer.texture, data: Data(result.pixels))
             let after = allPatches(layer.texture)
             var changedBefore: [TilePatch] = [], changedAfter: [TilePatch] = []
@@ -623,14 +684,16 @@ final class PaintEngine: ObservableObject {
             return true
         }
         guard success else { throw PaintDocumentError.invalid("画像用のメモリが不足しています。") }
-        waitForGPU()
+        guard waitForGPU() else { throw PaintDocumentError.invalid(gpuFailure!) }
         let texture = try makeTexture(); replace(texture, data: Data(pixels))
         let layer = PaintLayer(properties: .init(name: "読み込んだ画像"), texture: texture)
         layers.append(layer); selectedLayerID = layer.id
         record(.insert(layer, layers.count - 1)); markDirty(fullRegion); commit()
     }
     func pngData() throws -> Data {
-        updateComposite(); waitForGPU()
+        updateComposite()
+        guard waitForGPU() else { throw PaintDocumentError.invalid(gpuFailure!) }
+        guard dirty == nil else { throw PaintDocumentError.invalid("画像の合成を完了できません。") }
         let pixels = read(composite)
         guard let provider = CGDataProvider(data: pixels as CFData),
               let image = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,

@@ -29,6 +29,9 @@ struct EditorRoot: View {
                 EditorWorkspace(model: model, engine: engine, panel: $panel)
                     .alert("操作を完了できませんでした", isPresented: Binding(
                         get: { engine.errorMessage != nil }, set: { if !$0 { engine.errorMessage = nil } })) {
+                            if engine.hasPendingCancellation {
+                                Button("復元を再試行") { engine.retryPendingCancellation() }
+                            }
                             Button("OK") { engine.errorMessage = nil }
                         } message: { Text(engine.errorMessage ?? "") }
             } else {
@@ -43,6 +46,7 @@ struct EditorRoot: View {
         .fileExporter(isPresented: $model.showExporter, document: model.exportFile,
                       contentType: model.exportType, defaultFilename: model.exportName, onCompletion: model.handleExport)
         .sheet(isPresented: $model.showNewCanvas) { NewCanvasSheet(model: model) }
+        .sheet(isPresented: $model.showRecoveryManager) { RecoveryManager(model: model) }
         .sheet(item: $panel) { value in
             if let engine = model.engine {
                 NavigationStack {
@@ -75,14 +79,15 @@ struct EditorRoot: View {
         .alert("前回の作業が見つかりました", isPresented: Binding(
             get: { model.recoveryURL != nil }, set: { if !$0 { model.recoveryURL = nil } }), presenting: model.recoveryURL) { url in
                 Button("復元する") { model.restoreRecovery(url) }
+                Button("復旧ファイルを選ぶ") { model.recoveryURL = nil; model.showRecoveryManager = true }
                 Button("新しく始める", role: .cancel) { model.recoveryURL = nil }
             } message: { _ in Text("自動保存した作品を開けます。復旧ファイルはアプリの保存領域に残ります。") }
         .onChange(of: scenePhase) { _, phase in
             if phase != .active {
-                model.engine?.endStroke()
-                Task { await model.saveRecovery() }
+                model.saveForBackground()
             }
         }
+        .onDisappear { model.saveForBackground() }
     }
 }
 
@@ -162,6 +167,9 @@ private struct EditorWorkspace: View {
                 Divider()
                 Button("作品を保存", systemImage: "square.and.arrow.down") { model.prepareExport(png: false) }
                 Button("PNGを書き出す", systemImage: "square.and.arrow.up") { model.prepareExport(png: true) }
+                Button("復旧ファイルを管理", systemImage: "clock.arrow.circlepath") {
+                    model.refreshRecoveryEntries(); model.showRecoveryManager = true
+                }
                 Divider()
                 Button("全体を表示", systemImage: "arrow.up.left.and.arrow.down.right") { engine.viewport.fit(); engine.requestDisplay?() }
                 Button("左右反転表示", systemImage: "arrow.left.and.right.righttriangle.left.righttriangle.right") { engine.viewport.mirrored.toggle(); engine.requestDisplay?() }

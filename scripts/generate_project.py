@@ -36,6 +36,8 @@ def configuration_list(key, settings):
         config = dict(settings)
         config["SWIFT_OPTIMIZATION_LEVEL"] = "-Onone" if name == "Debug" else "-O"
         config["DEBUG_INFORMATION_FORMAT"] = "dwarf" if name == "Debug" else "dwarf-with-dsym"
+        if settings.get("CODE_SIGN_ENTITLEMENTS"):
+            config["ENABLE_HARDENED_RUNTIME"] = "YES" if name == "Release" else "NO"
         config["ENABLE_TESTABILITY"] = "YES" if name == "Debug" else "NO"
         if name == "Debug":
             config["SWIFT_ACTIVE_COMPILATION_CONDITIONS"] = "DEBUG"

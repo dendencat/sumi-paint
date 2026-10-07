@@ -24,7 +24,7 @@ SwiftUIとMetalを使用し、アプリに組み込む外部パッケージは�
 - 現在のレイヤーを参照する塗りつぶし、スポイト、最近使った色。
 - 描画・レイヤー編集・変形などのUndo / Redo。
 - `.sumipaint` 形式で保存・再編集、PNG / JPEG / HEIC読み込み、透過PNG書き出し。
-- 編集後の自動復旧用保存。前回の作品を起動時に復元できる。
+- 連続描画中にも行う自動復旧用保存。復旧ファイルの一覧から作品を選択・削除できる。
 
 初期版の上限は2048×2048ピクセル・8レイヤー、画像データ128 MiB、Undo履歴64 MiBです。色仕様はsRGBの8bit RGBAです。
 
@@ -71,11 +71,13 @@ python3 scripts/check_repository.py
 python3 -m unittest discover -s Tests/AutomationTests
 ```
 
-GitHub Actionsでは、共通処理のテスト、macOSアプリのビルドとMetal描画の統合テスト、iOSアプリのビルド、iPhone・iPadシミュレーターの起動を行います。シミュレーター画像はActionsの成果物に保存します。Metalデバイスのない実行環境では、GPU統合テストはスキップされます。
+GitHub Actionsでは、共通処理のテスト、macOSアプリのビルドとMetal描画の統合テスト、iOSアプリのビルド、iPhone・iPadシミュレーターの起動を行います。シミュレーター画像はActionsの成果物に保存します。必要なMetalデバイスがなければ、統合テストは失敗として扱います。
 
 Release構成のMac配布ZIPも展開して起動します。`main`の両OSジョブが成功した場合に、GitHub Releasesへプレビューを自動公開します。
 
 筆圧、遅延、手ぶれ補正の感触、長時間のメモリ使用量は、実機と入力機器での確認が必要です。[実装状況と確認項目](docs/implementation.md)を参照してください。
+
+本番運用・セキュリティレビューの修正と残課題は[対応レポート](docs/review-remediation.md)に記載しています。実機の受け入れ確認と正式配布の準備は継続中です。
 
 ## 構成
 

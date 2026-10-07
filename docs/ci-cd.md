@@ -38,4 +38,4 @@ Releaseのタグは `preview-<run_id>` です。公開前に元のコミット�
 
 API Keyは `ASC_KEY_ID`・`ASC_ISSUER_ID`・`ASC_PRIVATE_KEY`、署名用情報は `APPLE_TEAM_ID`・`IOS_DISTRIBUTION_P12_BASE64`・`IOS_DISTRIBUTION_P12_PASSWORD`・`IOS_PROFILE_BASE64` といったEnvironment Secretsとして管理する想定です。現在はこれらの値を設定する必要はありません。
 
-MacではDeveloper ID Application証明書と公証用の認証を追加し、Hardened Runtimeで署名、`notarytool`で公証、`stapler`で結果を添付してから配布する形へ移行します。これにより初回起動時の手動許可を減らせます。
+Macの現在のReleaseプレビューもApp SandboxとHardened Runtimeを有効にしてアドホック署名します。登録後はDeveloper ID Application証明書と公証用の認証を追加し、`notarytool`で公証、`stapler`で結果を添付してから配布する形へ移行します。これにより初回起動時の手動許可を減らせます。

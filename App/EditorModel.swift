@@ -32,54 +32,115 @@ final class EditorModel: ObservableObject {
     @Published var exportType: UTType = .sumiPainting
     @Published var exportName = "作品"
     @Published var recoveryURL: URL?
+    @Published var recoveryEntries: [RecoveryEntry] = []
+    @Published var showRecoveryManager = false
+    @Published private(set) var isSavingRecovery = false
     private var importingImage = false
     private var recoveryTask: Task<Void, Never>?
+    private var recoverySave: Task<Bool, Never>?
+    private var recoverySchedule: RecoverySchedule
+    private var hasWork = false
+    #if DEBUG
+    func cancelRecoveryForTesting() { recoveryTask?.cancel() }
+    #endif
     private let sessionID = UUID()
     private let writer = RecoveryWriter()
     private var latestWrittenRevision: UInt64?
-    private var recoveryFolder: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    private let recoveryFolder: URL
+    init(recoveryFolder: URL? = nil, idleDelay: Double = 2, maximumInterval: Double = 10) {
+        self.recoveryFolder = recoveryFolder ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("SumiPaint/Recovery", isDirectory: true)
-    }
-    init() {
+        recoverySchedule = .init(idleDelay: idleDelay, maximumInterval: maximumInterval)
         do {
             let engine = try PaintEngine(); self.engine = engine
             #if os(iOS)
             engine.fingerDrawing = UIDevice.current.userInterfaceIdiom == .phone
             #endif
-            engine.onCommit = { [weak self] in self?.scheduleRecovery() }
-            let files = (try? FileManager.default.contentsOfDirectory(at: recoveryFolder,
-                includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
-            recoveryURL = files.filter { $0.pathExtension == "sumipaint" }.max {
-                let a = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                let b = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                return a < b
-            }
+            engine.onContentChange = { [weak self] in self?.hasWork = true; self?.scheduleRecovery() }
+            refreshRecoveryEntries()
+            recoveryURL = recoveryEntries.first?.url
+            #if os(macOS)
+            RecoverySessions.shared.add(self)
+            #endif
         } catch { engine = nil; startupError = error.localizedDescription }
     }
     private func scheduleRecovery() {
-        recoveryTask?.cancel()
-        status = "変更あり · 自動保存を待っています"
+        recoverySchedule.noteChange(at: ProcessInfo.processInfo.systemUptime)
+        if status != "変更あり · 自動保存を待っています" { status = "変更あり · 自動保存を待っています" }
+        guard recoveryTask == nil else { return }
         recoveryTask = Task { [weak self] in
-            do { try await Task.sleep(for: .seconds(2)) } catch { return }
             guard let self else { return }
-            await self.saveRecovery()
+            defer { recoveryTask = nil }
+            while let delay = recoverySchedule.delay(at: ProcessInfo.processInfo.systemUptime) {
+                do { try await Task.sleep(for: .seconds(max(0.01, delay))) } catch { return }
+                guard !Task.isCancelled else { return }
+                if (recoverySchedule.delay(at: ProcessInfo.processInfo.systemUptime) ?? 0) > 0 { continue }
+                if engine?.isBusy == true {
+                    do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
+                    continue
+                }
+                guard await saveRecovery() else { return }
+            }
         }
     }
     @discardableResult
     func saveRecovery() async -> Bool {
-        guard let engine, !engine.isBusy, !engine.strokeActive else { scheduleRecovery(); return false }
-        let revision = engine.revision
+        if let recoverySave {
+            guard await recoverySave.value else { return false }
+            return await saveRecovery()
+        }
+        guard hasWork else { return true }
+        guard let engine, !engine.isBusy, !engine.hasPendingCancellation else { return false }
+        let revision = engine.contentRevision
         if latestWrittenRevision == revision { return true }
-        let snapshot = engine.snapshot()
-        let folder = recoveryFolder
-        let url = folder.appendingPathComponent("\(snapshot.id.uuidString)-\(sessionID.uuidString).sumipaint")
+        let task = Task { [weak self] () -> Bool in
+            guard let self else { return false }
+            defer { recoverySave = nil; isSavingRecovery = false }
+            return await writeRecovery()
+        }
+        recoverySave = task; isSavingRecovery = true
+        return await task.value
+    }
+    private func writeRecovery() async -> Bool {
+        guard let engine, !engine.isBusy, !engine.hasPendingCancellation else { return false }
+        let capturedAt = ProcessInfo.processInfo.systemUptime
+        let revision = engine.contentRevision
         do {
+            let snapshot = try engine.snapshot()
+            recoverySchedule.reset()
+            let url = recoveryFolder.appendingPathComponent("\(snapshot.id.uuidString)-\(sessionID.uuidString).sumipaint")
             try await writer.write(snapshot, revision: revision, to: url)
             latestWrittenRevision = max(latestWrittenRevision ?? 0, revision)
-            if engine.revision == revision { status = "復旧用に自動保存済み" }
+            refreshRecoveryEntries()
+            if engine.contentRevision == revision { status = "復旧用に自動保存済み" }
             return true
-        } catch { engine.errorMessage = "自動保存に失敗しました: \(error.localizedDescription)"; return false }
+        } catch {
+            recoverySchedule.noteChange(at: capturedAt)
+            status = "復旧保存に失敗しました"
+            engine.errorMessage = "自動保存に失敗しました: \(error.localizedDescription)"; return false
+        }
+    }
+    func refreshRecoveryEntries() {
+        do { recoveryEntries = try RecoveryCatalog.entries(in: recoveryFolder) }
+        catch { engine?.errorMessage = "復旧ファイルの一覧を取得できません。" }
+    }
+    func removeRecovery(_ entry: RecoveryEntry) {
+        guard !isSavingRecovery else { return }
+        do {
+            try RecoveryCatalog.remove(entry, from: recoveryFolder)
+            latestWrittenRevision = nil; refreshRecoveryEntries()
+        }
+        catch { engine?.errorMessage = error.localizedDescription }
+    }
+    func saveForBackground() {
+        engine?.endStroke()
+        #if os(iOS)
+        let budget = BackgroundSaveBudget()
+        budget.begin()
+        Task { defer { budget.finish() }; _ = await saveRecovery() }
+        #else
+        Task { _ = await saveRecovery() }
+        #endif
     }
     func newCanvas(width: Int, height: Int) {
         guard let engine, !fileBusy, !engine.isBusy, !engine.strokeActive else { return }
@@ -90,6 +151,7 @@ final class EditorModel: ObservableObject {
             do {
                 try engine.newDocument(width: width, height: height)
                 latestWrittenRevision = nil; showNewCanvas = false; status = "新しいキャンバス"
+                hasWork = false; recoverySchedule.reset()
             } catch { engine.errorMessage = error.localizedDescription }
         }
     }
@@ -117,7 +179,7 @@ final class EditorModel: ObservableObject {
                     guard size <= (image ? 32 * 1024 * 1024 : DocumentSnapshot.maximumFileBytes) else {
                         throw PaintDocumentError.invalid("ファイルが大きすぎます。")
                     }
-                    return try Data(contentsOf: url)
+                    return try BoundedFileReader.read(url, maximumBytes: image ? 32 * 1024 * 1024 : DocumentSnapshot.maximumFileBytes)
                 }.value
                 if image { try engine.importImage(data) }
                 else {
@@ -141,7 +203,7 @@ final class EditorModel: ObservableObject {
                 let data: Data
                 if png { data = try engine.pngData() }
                 else {
-                    let snapshot = engine.snapshot()
+                    let snapshot = try engine.snapshot()
                     data = try await Task.detached(priority: .userInitiated) { try snapshot.encoded() }.value
                 }
                 exportFile = ExportFile(data: data); exportType = png ? .png : .sumiPainting

@@ -128,7 +128,8 @@ public struct DocumentSnapshot: Codable, Equatable, Sendable {
         for layer in layers {
             let properties = layer.properties
             guard layer.pixels.count == byteCount, properties.opacity.isFinite,
-                  (0...1).contains(properties.opacity), properties.name.count <= 256 else {
+                  (0...1).contains(properties.opacity), properties.name.utf8.count <= 64 * 1024,
+                  properties.name.count <= 256 else {
                 throw PaintDocumentError.invalid("レイヤーのデータが破損しています。")
             }
             // Premultiplication is an invariant used by the GPU compositing equations.
@@ -147,6 +148,7 @@ public struct DocumentSnapshot: Codable, Equatable, Sendable {
     }
     public static func decode(_ data: Data) throws -> Self {
         guard data.count <= maximumFileBytes else { throw PaintDocumentError.invalid("ファイルが大きすぎます。") }
+        try PropertyListPreflight.validate(data)
         let value = try PropertyListDecoder().decode(Self.self, from: data)
         try value.validate()
         return value

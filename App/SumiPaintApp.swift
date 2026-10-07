@@ -2,6 +2,9 @@ import SwiftUI
 
 @main
 struct SumiPaintApp: App {
+    #if os(macOS)
+    @NSApplicationDelegateAdaptor(PaintApplicationDelegate.self) private var applicationDelegate
+    #endif
     var body: some Scene {
         WindowGroup("Sumi Paint") { EditorRoot().preferredColorScheme(.dark) }
             .defaultSize(width: 1180, height: 800)
@@ -14,7 +17,7 @@ struct SumiPaintApp: App {
 #if os(macOS)
 struct PaintCommands: Commands {
     @FocusedValue(\.paintEditor) private var editor
-    private var busy: Bool { editor?.fileBusy == true || editor?.engine?.isBusy == true || editor?.engine?.strokeActive == true }
+    private var busy: Bool { editor?.fileBusy == true || editor?.engine?.isBusy == true || editor?.engine?.strokeActive == true || editor?.engine?.gpuFailure != nil }
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
             Button("新しいキャンバス") { editor?.showNewCanvas = true }.keyboardShortcut("n").disabled(busy)

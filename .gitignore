@@ -11,3 +11,7 @@ __pycache__/
 *.log
 *.p12
 *.mobileprovision
+*.p8
+*.pem
+.env
+.env.*
