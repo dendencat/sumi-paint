@@ -16,17 +16,6 @@ struct ExportFile: FileDocument {
     func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper { FileWrapper(regularFileWithContents: data) }
 }
 
-private actor RecoveryWriter {
-    private var writtenRevisions: [URL: UInt64] = [:]
-    func write(_ snapshot: DocumentSnapshot, revision: UInt64, to url: URL) throws {
-        if let written = writtenRevisions[url], written >= revision { return }
-        let data = try snapshot.encoded()
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try data.write(to: url, options: .atomic)
-        writtenRevisions[url] = revision
-    }
-}
-
 @MainActor
 final class EditorModel: ObservableObject {
     let engine: PaintEngine?

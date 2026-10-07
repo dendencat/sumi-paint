@@ -96,4 +96,17 @@ final class DrawingCoreTests: XCTestCase {
     func testCorruptFileFailsRatherThanReturningPartialDocument() {
         XCTAssertThrowsError(try DocumentSnapshot.decode(Data("not a painting".utf8)))
     }
+    func testRecoverySaveCannotOverwriteNewerGeneration() async throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let url = folder.appendingPathComponent("test.sumipaint")
+        let properties = LayerProperties(name: "test")
+        let layer = LayerSnapshot(properties: properties, pixels: Data(repeating: 0, count: 16))
+        let old = DocumentSnapshot(width: 2, height: 2, layers: [layer], selectedLayerID: properties.id)
+        var newest = old; newest.layers[0].pixels.replaceSubrange(0..<4, with: [255, 0, 0, 255])
+        let writer = RecoveryWriter()
+        try await writer.write(newest, revision: 2, to: url)
+        try await writer.write(old, revision: 1, to: url)
+        XCTAssertEqual(try DocumentSnapshot.decode(Data(contentsOf: url)), newest)
+    }
 }

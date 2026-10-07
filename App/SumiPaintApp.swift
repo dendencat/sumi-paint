@@ -29,8 +29,8 @@ struct PaintCommands: Commands {
             Button("やり直す") { editor?.engine?.redo() }.keyboardShortcut("z", modifiers: [.command, .shift]).disabled(busy || editor?.engine?.canRedo != true)
         }
         CommandMenu("キャンバス") {
-            Button("全体を表示") { editor?.engine?.viewport.fit(); editor?.engine?.requestDisplay?() }.keyboardShortcut("0")
-            Button("左右反転表示") { editor?.engine?.viewport.mirrored.toggle(); editor?.engine?.requestDisplay?() }
+            Button("全体を表示") { editor?.engine?.viewport.fit(); editor?.engine?.requestDisplay?() }.keyboardShortcut("0").disabled(busy)
+            Button("左右反転表示") { editor?.engine?.viewport.mirrored.toggle(); editor?.engine?.requestDisplay?() }.disabled(busy)
             Button("すべて選択") { editor?.engine?.selectAll() }.keyboardShortcut("a").disabled(busy)
             Button("選択を解除") { editor?.engine?.clearSelection() }.keyboardShortcut("d").disabled(busy)
             Button("選択した画素を消去") { editor?.engine?.clearSelectedPixels() }.disabled(busy)
