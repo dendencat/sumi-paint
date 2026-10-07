@@ -38,7 +38,10 @@ final class PaintEngineTests: XCTestCase {
         XCTAssertEqual(before[(32 * 64 + 44) * 4 + 3], 0)
         engine.beginStroke(.init(point: .init(16, 10), time: 2))
         engine.endStroke(cancelled: true)
-        XCTAssertEqual(engine.snapshot().layers[0].pixels, before)
+        let restored = engine.snapshot().layers[0].pixels
+        let differences = before.indices.filter { before[$0] != restored[$0] }
+        let details = differences.prefix(8).map { "\($0):\(before[$0])->\(restored[$0])" }.joined(separator: ", ")
+        XCTAssertTrue(differences.isEmpty, "Cancelled stroke changed \(differences.count) bytes: \(details)")
     }
     func testLayerStructureAndPropertiesUndo() async throws {
         let engine = try makeEngine()

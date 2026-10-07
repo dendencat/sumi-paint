@@ -113,6 +113,7 @@ final class PaintEngine: ObservableObject {
     private var redoRecords: [EditRecord] = []
     private let historyBudget = 64 * 1024 * 1024
     private var strokeSeed: Float = 0
+    private var gpuWrittenTextures: [ObjectIdentifier: MTLTexture] = [:]
 
     init() throws {
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue(),
@@ -179,13 +180,16 @@ final class PaintEngine: ObservableObject {
     private func waitForGPU() {
         guard let barrier = queue.makeCommandBuffer() else { return }
         #if os(macOS)
-        let resources = layers.map(\.texture) + [composite].compactMap { $0 }
+        // Synchronizing a CPU-edited managed texture before a GPU read can overwrite
+        // the restored pixels with the old GPU copy. Only synchronize actual GPU writes.
+        let resources = Array(gpuWrittenTextures.values)
         if resources.contains(where: { $0.storageMode == .managed }), let blit = barrier.makeBlitCommandEncoder() {
             for texture in resources where texture.storageMode == .managed { blit.synchronize(resource: texture) }
             blit.endEncoding()
         }
         #endif
         barrier.commit(); barrier.waitUntilCompleted()
+        gpuWrittenTextures.removeAll()
     }
     private func read(_ texture: MTLTexture, region: MTLRegion? = nil) -> Data {
         let region = region ?? fullRegion
@@ -196,6 +200,7 @@ final class PaintEngine: ObservableObject {
     private func replace(_ texture: MTLTexture, data: Data, region: MTLRegion? = nil) {
         let region = region ?? fullRegion
         data.withUnsafeBytes { texture.replace(region: region, mipmapLevel: 0, withBytes: $0.baseAddress!, bytesPerRow: region.size.width * 4) }
+        gpuWrittenTextures.removeValue(forKey: ObjectIdentifier(texture))
     }
 
     func newDocument(width: Int, height: Int) throws {
@@ -337,7 +342,9 @@ final class PaintEngine: ObservableObject {
         encoder.setVertexBytes(&size, length: MemoryLayout<SIMD2<Float>>.stride, index: 1)
         encoder.setFragmentBytes(&selected, length: 4, index: 0); encoder.setFragmentTexture(selectionTexture, index: 0)
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6, instanceCount: dabs.count)
-        encoder.endEncoding(); command.commit(); markDirty(bounds)
+        encoder.endEncoding(); command.commit()
+        gpuWrittenTextures[ObjectIdentifier(layer.texture)] = layer.texture
+        markDirty(bounds)
     }
 
     private func markDirty(_ region: MTLRegion) {
@@ -378,7 +385,9 @@ final class PaintEngine: ObservableObject {
         guard let blit = command.makeBlitCommandEncoder() else { return }
         blit.copy(from: destination, sourceSlice: 0, sourceLevel: 0, sourceOrigin: region.origin, sourceSize: region.size,
                   to: composite, destinationSlice: 0, destinationLevel: 0, destinationOrigin: region.origin)
-        blit.endEncoding(); command.commit(); dirty = nil
+        blit.endEncoding(); command.commit()
+        gpuWrittenTextures[ObjectIdentifier(composite)] = composite
+        dirty = nil
     }
     func render(in view: MTKView) {
         updateComposite()
