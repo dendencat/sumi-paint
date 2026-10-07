@@ -294,7 +294,13 @@ final class PaintEngine: ObservableObject {
         waitForGPU()
         let before = beforeTiles.values.sorted { $0.key < $1.key }
         if cancelled {
+            #if DEBUG
+            print("Cancel diagnostics: patches=\(before.count), storage=\(layer.texture.storageMode.rawValue), current=\(read(layer.texture).filter { $0 != 0 }.count), captured=\(before.reduce(0) { $0 + $1.data.filter { $0 != 0 }.count })")
+            #endif
             applyPatches(before, to: layer); markDirty(fullRegion)
+            #if DEBUG
+            print("Cancel diagnostics after restore: \(read(layer.texture).filter { $0 != 0 }.count)")
+            #endif
         } else if !before.isEmpty {
             let after = before.map { tile in patch(layer.texture, x: tile.x, y: tile.y, width: tile.width, height: tile.height) }
             record(.pixels(layer.id, before, after, nil, nil)); commit()
