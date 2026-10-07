@@ -294,13 +294,7 @@ final class PaintEngine: ObservableObject {
         waitForGPU()
         let before = beforeTiles.values.sorted { $0.key < $1.key }
         if cancelled {
-            #if DEBUG
-            print("Cancel diagnostics: patches=\(before.count), storage=\(layer.texture.storageMode.rawValue), current=\(read(layer.texture).filter { $0 != 0 }.count), captured=\(before.reduce(0) { $0 + $1.data.filter { $0 != 0 }.count })")
-            #endif
             applyPatches(before, to: layer); markDirty(fullRegion)
-            #if DEBUG
-            print("Cancel diagnostics after restore: \(read(layer.texture).filter { $0 != 0 }.count)")
-            #endif
         } else if !before.isEmpty {
             let after = before.map { tile in patch(layer.texture, x: tile.x, y: tile.y, width: tile.width, height: tile.height) }
             record(.pixels(layer.id, before, after, nil, nil)); commit()
@@ -427,7 +421,33 @@ final class PaintEngine: ObservableObject {
         canUndo = !undoRecords.isEmpty; canRedo = false
     }
     private func applyPatches(_ patches: [TilePatch], to layer: PaintLayer) {
-        for tile in patches { replace(layer.texture, data: tile.data, region: MTLRegionMake2D(tile.x, tile.y, tile.width, tile.height)) }
+        guard !patches.isEmpty else { return }
+        // Restore through the same GPU queue as painting. CPU replace calls on a
+        // recently rendered shared texture can race with the driver's optimized copy.
+        var uploads: [(TilePatch, MTLBuffer, Int)] = []
+        for tile in patches {
+            let rowBytes = (tile.width * 4 + 255) / 256 * 256
+            guard let buffer = device.makeBuffer(length: rowBytes * tile.height, options: .storageModeShared) else {
+                errorMessage = "画像を復元するメモリが不足しています。"; return
+            }
+            tile.data.withUnsafeBytes { bytes in
+                for row in 0..<tile.height {
+                    buffer.contents().advanced(by: row * rowBytes).copyMemory(
+                        from: bytes.baseAddress!.advanced(by: row * tile.width * 4), byteCount: tile.width * 4)
+                }
+            }
+            uploads.append((tile, buffer, rowBytes))
+        }
+        guard let command = queue.makeCommandBuffer(), let blit = command.makeBlitCommandEncoder() else {
+            errorMessage = "画像を復元できません。"; return
+        }
+        for (tile, buffer, rowBytes) in uploads {
+            blit.copy(from: buffer, sourceOffset: 0, sourceBytesPerRow: rowBytes, sourceBytesPerImage: rowBytes * tile.height,
+                sourceSize: .init(width: tile.width, height: tile.height, depth: 1),
+                to: layer.texture, destinationSlice: 0, destinationLevel: 0, destinationOrigin: .init(x: tile.x, y: tile.y, z: 0))
+        }
+        blit.endEncoding(); submit(command)
+        gpuWrittenTextures[ObjectIdentifier(layer.texture)] = layer.texture
     }
     private func apply(_ record: EditRecord, forward: Bool) {
         switch record {

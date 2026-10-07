@@ -36,12 +36,15 @@ final class PaintEngineTests: XCTestCase {
         let before = engine.snapshot().layers[0].pixels
         XCTAssertGreaterThan(before[(32 * 64 + 20) * 4 + 3], 200)
         XCTAssertEqual(before[(32 * 64 + 44) * 4 + 3], 0)
-        engine.beginStroke(.init(point: .init(16, 10), time: 2))
-        engine.endStroke(cancelled: true)
-        let restored = engine.snapshot().layers[0].pixels
-        let differences = before.indices.filter { before[$0] != restored[$0] }
-        let details = differences.prefix(8).map { "\($0):\(before[$0])->\(restored[$0])" }.joined(separator: ", ")
-        XCTAssertTrue(differences.isEmpty, "Cancelled stroke changed \(differences.count) bytes: \(details)")
+        // Repeated immediate cancellations expose CPU/GPU timing races.
+        for attempt in 0..<24 {
+            engine.beginStroke(.init(point: .init(12 + Double(attempt % 8), attempt.isMultiple(of: 2) ? 10 : 50), time: Double(attempt + 2)))
+            engine.endStroke(cancelled: true)
+            let restored = engine.snapshot().layers[0].pixels
+            let differences = before.indices.filter { before[$0] != restored[$0] }
+            let details = differences.prefix(8).map { "\($0):\(before[$0])->\(restored[$0])" }.joined(separator: ", ")
+            XCTAssertTrue(differences.isEmpty, "Cancellation \(attempt) changed \(differences.count) bytes: \(details)")
+        }
     }
     func testLayerStructureAndPropertiesUndo() async throws {
         let engine = try makeEngine()
