@@ -126,7 +126,7 @@ final class TouchCanvas: MTKView, MTKViewDelegate, UIGestureRecognizerDelegate {
     }
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
     func draw(in view: MTKView) { engine.render(in: view) }
-    func gestureRecognizerShouldBegin(_ recognizer: UIGestureRecognizer) -> Bool {
+    override func gestureRecognizerShouldBegin(_ recognizer: UIGestureRecognizer) -> Bool {
         guard !engine.isBusy else { return false }
         if let pan = recognizer as? UIPanGestureRecognizer, pan.maximumNumberOfTouches == 1 {
             return engine.tool == .hand || !engine.fingerDrawing

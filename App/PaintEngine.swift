@@ -44,7 +44,10 @@ enum EditRecord {
     var byteCost: Int {
         switch self {
         case .pixels(_, let before, let after, let a, let b):
-            return before.reduce(0) { $0 + $1.data.count } + after.reduce(0) { $0 + $1.data.count } + (a?.count ?? 0) + (b?.count ?? 0)
+            let beforeBytes = before.reduce(0) { $0 + $1.data.count }
+            let afterBytes = after.reduce(0) { $0 + $1.data.count }
+            let selectionBytes = (a?.count ?? 0) + (b?.count ?? 0)
+            return beforeBytes + afterBytes + selectionBytes
         case .insert(let layer, _), .remove(let layer, _): return layer.texture.width * layer.texture.height * 4
         default: return 1024
         }
