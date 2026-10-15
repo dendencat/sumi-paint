@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 #if os(iOS)
 import UIKit
 #else
@@ -99,80 +100,133 @@ struct ColorPanel: View {
 
 struct LayerPanel: View {
     @ObservedObject var engine: PaintEngine
+    @State private var editingID: UUID?
     @State private var name = ""
-    @State private var opacity = 1.0
+    @State private var draggedID: UUID?
+    @FocusState private var nameFocused: Bool
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text("レイヤー").font(.headline); Spacer()
-                Text("\(engine.layers.count)/8").font(.caption).foregroundStyle(.secondary)
-            }
-            HStack(spacing: 12) {
-                icon("plus", label: "レイヤーを追加") { engine.addLayer() }
-                icon("plus.square.on.square", label: "レイヤーを複製") { engine.addLayer(duplicate: true) }
-                icon("arrow.up", label: "上に移動") { engine.moveLayer(1) }
-                icon("arrow.down", label: "下に移動") { engine.moveLayer(-1) }
-                icon("trash", label: "レイヤーを削除") { engine.deleteLayer() }
-                    .disabled(engine.layers.count <= 1)
-            }.buttonStyle(.borderless)
-            ForEach(engine.layers.reversed()) { layer in
-                HStack(spacing: 10) {
-                    Button {
-                        engine.changeLayer(layer.id) { $0.visible.toggle() }
-                    } label: { Image(systemName: layer.properties.visible ? "eye" : "eye.slash").frame(width: 22, height: 32) }
-                        .buttonStyle(.plain).accessibilityLabel("\(layer.properties.name)の表示を切り替える")
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(layer.properties.name).font(.caption).lineLimit(1)
-                        HStack(spacing: 5) {
-                            if layer.properties.locked { Image(systemName: "lock.fill") }
-                            if layer.properties.alphaLocked { Image(systemName: "checkerboard.rectangle") }
-                            if layer.properties.clipping { Image(systemName: "arrow.turn.down.right") }
-                            Text("\(Int(layer.properties.opacity * 100))%")
-                        }.font(.caption2).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                }.padding(9)
-                    .background(engine.selectedLayerID == layer.id ? Color.mint.opacity(0.14) : Color.white.opacity(0.035),
-                                in: RoundedRectangle(cornerRadius: 8))
-                    .contentShape(Rectangle())
-                    .onTapGesture { if !engine.strokeActive { engine.selectedLayerID = layer.id; sync() } }
+                Text("\(engine.layers.count)/8").foregroundStyle(.secondary)
             }
             if let selected = engine.selectedLayer {
-                Divider()
-                HStack {
-                    TextField("レイヤー名", text: $name).textFieldStyle(.roundedBorder)
-                    Button("変更") { engine.changeLayer(selected.id) { $0.name = name } }.font(.caption)
-                }
                 Picker("合成", selection: Binding(get: { selected.properties.blend }, set: { mode in
                     engine.changeLayer(selected.id) { $0.blend = mode }
                 })) {
                     Text("通常").tag(LayerBlend.normal); Text("乗算").tag(LayerBlend.multiply); Text("スクリーン").tag(LayerBlend.screen)
-                }.font(.caption)
-                VStack {
-                    HStack { Text("不透明度"); Spacer(); Text("\(Int(opacity * 100))%").monospacedDigit() }.font(.caption)
-                    Slider(value: $opacity, in: 0...1, onEditingChanged: { editing in
-                        if !editing { engine.changeLayer(selected.id) { $0.opacity = opacity } }
-                    }).accessibilityLabel("レイヤーの不透明度")
                 }
-                layerToggle("ロック", selected: selected, keyPath: \.locked)
-                layerToggle("透明度を保護", selected: selected, keyPath: \.alphaLocked)
-                layerToggle("下のレイヤーにクリッピング", selected: selected, keyPath: \.clipping)
+                HStack {
+                    Text("不透明度")
+                    Slider(value: Binding(get: { selected.properties.opacity }, set: {
+                        engine.previewLayerOpacity(selected.id, value: $0)
+                    }), in: 0...1, onEditingChanged: { if !$0 { engine.finishLayerOpacityEdit() } })
+                        .accessibilityLabel("レイヤーの不透明度")
+                    Text("\(Int((selected.properties.opacity * 100).rounded()))%")
+                        .monospacedDigit().frame(width: 34, alignment: .trailing)
+                }
+                HStack(spacing: 16) {
+                    propertyButton("lock", title: "ロック", selected: selected, keyPath: \.locked)
+                    propertyButton("checkerboard.rectangle", title: "透明度を保護", selected: selected, keyPath: \.alphaLocked)
+                    propertyButton("arrow.turn.down.right", title: "下のレイヤーにクリッピング", selected: selected, keyPath: \.clipping)
+                        .disabled(engine.layers.first?.id == selected.id)
+                    Spacer()
+                }
             }
+            Divider()
+            ScrollView {
+                LazyVStack(spacing: 4) {
+                    ForEach(engine.layers.reversed()) { layer in layerRow(layer) }
+                }
+            }.frame(minHeight: 100, maxHeight: .infinity)
+            Divider()
+            HStack(spacing: 16) {
+                icon("plus", label: "レイヤーを追加") { engine.addLayer() }.disabled(engine.layers.count >= 8)
+                icon("plus.square.on.square", label: "レイヤーを複製") { engine.addLayer(duplicate: true) }.disabled(engine.layers.count >= 8)
+                Spacer(minLength: 0)
+                icon("arrow.up", label: "上に移動") { engine.moveLayer(1) }.disabled(engine.layers.last?.id == engine.selectedLayerID)
+                icon("arrow.down", label: "下に移動") { engine.moveLayer(-1) }.disabled(engine.layers.first?.id == engine.selectedLayerID)
+                icon("trash", label: "レイヤーを削除") { engine.deleteLayer() }.disabled(engine.layers.count <= 1)
+            }.buttonStyle(.borderless)
         }
         .font(.caption)
-        .disabled(engine.isBusy)
-        .onAppear(perform: sync)
-        .onChange(of: engine.selectedLayerID) { _, _ in sync() }
-        .onChange(of: engine.revision) { _, _ in sync() }
+        .disabled(engine.isBusy || engine.strokeActive)
+        .onChange(of: engine.selectedLayerID) { _, _ in finishName(); engine.finishLayerOpacityEdit() }
+        .onChange(of: nameFocused) { _, focused in if !focused { finishName() } }
+        .onDisappear { finishName(); engine.finishLayerOpacityEdit() }
     }
-    private func sync() { name = engine.selectedLayer?.properties.name ?? ""; opacity = engine.selectedLayer?.properties.opacity ?? 1 }
+    private func layerRow(_ layer: PaintLayer) -> some View {
+        let selected = engine.selectedLayerID == layer.id
+        return HStack(spacing: 6) {
+            if layer.properties.clipping { Text("↳").foregroundStyle(.secondary) }
+            Button { engine.changeLayer(layer.id) { $0.visible.toggle() } } label: {
+                Image(systemName: layer.properties.visible ? "eye" : "eye.slash").frame(width: 20, height: 40)
+            }.buttonStyle(.plain).accessibilityLabel("\(layer.properties.name)の表示を切り替える")
+            ZStack {
+                CheckerboardView()
+                if let image = engine.thumbnail(for: layer) {
+                    Image(decorative: image, scale: 2).resizable().interpolation(.medium)
+                }
+            }.frame(width: 40, height: 40).clipped().accessibilityLabel("\(layer.properties.name)のサムネイル")
+            if editingID == layer.id {
+                TextField("レイヤー名", text: $name).textFieldStyle(.plain).focused($nameFocused)
+                    .onSubmit { finishName() }
+            } else {
+                Text(layer.properties.name).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
+                    .onTapGesture(count: 2) { beginName(layer) }
+                    .onTapGesture { engine.selectedLayerID = layer.id }
+                    .contextMenu { Button("名前を変更") { beginName(layer) } }
+            }
+            Text("\(Int((layer.properties.opacity * 100).rounded()))%")
+                .font(.caption2).monospacedDigit().foregroundStyle(.secondary)
+        }
+        .padding(.leading, layer.properties.clipping ? 12 : 0)
+        .padding(.horizontal, 6).padding(.vertical, 4)
+        .background(selected ? Color.mint.opacity(0.14) : Color.clear)
+        .overlay(alignment: .leading) { if selected { Rectangle().fill(.mint).frame(width: 3) } }
+        .contentShape(Rectangle()).onTapGesture { engine.selectedLayerID = layer.id }
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .onDrag { draggedID = layer.id; return NSItemProvider(object: layer.id.uuidString as NSString) }
+        .onDrop(of: [.plainText], isTargeted: nil) { providers in
+            guard !providers.isEmpty, let id = draggedID,
+                  let target = engine.layers.firstIndex(where: { $0.id == layer.id }) else { return false }
+            engine.reorderLayer(id, to: target); draggedID = nil; return true
+        }
+    }
+    private func beginName(_ layer: PaintLayer) {
+        finishName(); engine.selectedLayerID = layer.id
+        name = layer.properties.name; editingID = layer.id; nameFocused = true
+    }
+    private func finishName() {
+        guard let id = editingID else { return }
+        editingID = nil; nameFocused = false
+        engine.changeLayer(id) { $0.name = name }
+    }
     private func icon(_ image: String, label: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) { Image(systemName: image).frame(minWidth: 20, minHeight: 30) }.help(label).accessibilityLabel(label)
+        Button(action: action) { Image(systemName: image).frame(minWidth: 16, minHeight: 26) }.help(label).accessibilityLabel(label)
     }
-    private func layerToggle(_ title: String, selected: PaintLayer, keyPath: WritableKeyPath<LayerProperties, Bool>) -> some View {
-        Toggle(title, isOn: Binding(get: { selected.properties[keyPath: keyPath] }, set: { value in
-            engine.changeLayer(selected.id) { $0[keyPath: keyPath] = value }
-        }))
+    private func propertyButton(_ image: String, title: String, selected: PaintLayer,
+                                keyPath: WritableKeyPath<LayerProperties, Bool>) -> some View {
+        Button { engine.changeLayer(selected.id) { $0[keyPath: keyPath].toggle() } } label: {
+            Image(systemName: image).frame(width: 28, height: 26)
+                .foregroundStyle(selected.properties[keyPath: keyPath] ? Color.mint : Color.secondary)
+                .background(selected.properties[keyPath: keyPath] ? Color.mint.opacity(0.14) : Color.clear)
+        }.buttonStyle(.plain).help(title).accessibilityLabel(title)
+            .accessibilityValue(selected.properties[keyPath: keyPath] ? "オン" : "オフ")
+    }
+}
+
+struct CheckerboardView: View {
+    var body: some View {
+        Canvas { context, size in
+            context.fill(Path(CGRect(origin: .zero, size: size)), with: .color(.white.opacity(0.85)))
+            for y in 0..<Int(ceil(size.height / 5)) {
+                for x in 0..<Int(ceil(size.width / 5)) where (x + y).isMultiple(of: 2) {
+                    context.fill(Path(CGRect(x: x * 5, y: y * 5, width: 5, height: 5)), with: .color(.gray.opacity(0.45)))
+                }
+            }
+        }
     }
 }
 

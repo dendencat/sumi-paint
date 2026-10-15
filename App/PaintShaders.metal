@@ -65,7 +65,7 @@ kernel void compositeLayer(texture2d<float, access::read> destination [[texture(
     uint2 point = origin + gid;
     if (point.x >= output.get_width() || point.y >= output.get_height()) return;
     float4 dst = destination.read(point), src = source.read(point) * settings.x;
-    if (settings.z > 0.5f) src *= clipBase.read(point).a * settings.w;
+
     float3 result = src.rgb + dst.rgb * (1 - src.a);
     if (settings.y > 0.5f) {
         float3 s = src.a > 0 ? src.rgb / src.a : float3(0);
@@ -73,7 +73,14 @@ kernel void compositeLayer(texture2d<float, access::read> destination [[texture(
         float3 blend = settings.y < 1.5f ? s * d : 1 - (1 - s) * (1 - d);
         result = src.rgb * (1 - dst.a) + dst.rgb * (1 - src.a) + blend * src.a * dst.a;
     }
-    output.write(float4(result, src.a + dst.a * (1 - src.a)), point);
+    if (settings.z > 0.5f) {
+        float3 s = src.a > 0 ? src.rgb / src.a : float3(0);
+        float3 d = dst.a > 0 ? dst.rgb / dst.a : float3(0);
+        float3 blend = settings.y < 0.5f ? s : (settings.y < 1.5f ? s * d : 1 - (1 - s) * (1 - d));
+        output.write(float4(dst.rgb * (1 - src.a) + blend * src.a * dst.a, dst.a), point);
+    } else {
+        output.write(float4(result, src.a + dst.a * (1 - src.a)), point);
+    }
 }
 
 struct QuadVertex { float4 position [[position]]; float2 uv; };

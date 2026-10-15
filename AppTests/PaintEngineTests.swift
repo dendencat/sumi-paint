@@ -182,6 +182,69 @@ final class PaintEngineTests: XCTestCase {
         engine.pickColor(at: .init(20, 32))
         XCTAssertLessThan(engine.color.red, 0.05); XCTAssertLessThan(engine.color.blue, 0.05)
     }
+    private func compositePixel(_ engine: PaintEngine, x: Int = 32, y: Int = 32) throws -> [UInt8] {
+        let source = try XCTUnwrap(CGImageSourceCreateWithData(try engine.pngData() as CFData, nil))
+        let image = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
+        var pixels = [UInt8](repeating: 0, count: engine.width * engine.height * 4)
+        try pixels.withUnsafeMutableBytes { bytes in
+            let context = try XCTUnwrap(CGContext(data: bytes.baseAddress, width: engine.width, height: engine.height,
+                bitsPerComponent: 8, bytesPerRow: engine.width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue))
+            context.draw(image, in: CGRect(x: 0, y: 0, width: engine.width, height: engine.height))
+        }
+        let offset = (y * engine.width + x) * 4
+        return Array(pixels[offset..<offset + 4])
+    }
+    func testLayerOpacityPreviewsImmediatelyAndUndoesOnce() async throws {
+        let engine = try makeEngine()
+        stroke(engine, from: .init(10, 32), to: .init(54, 32))
+        let id = try XCTUnwrap(engine.selectedLayerID), revision = engine.revision
+        for opacity in [0.8, 0.5, 0.3] {
+            engine.previewLayerOpacity(id, value: opacity)
+            XCTAssertEqual(Double(try compositePixel(engine)[3]), opacity * 255, accuracy: 2)
+            XCTAssertEqual(engine.revision, revision, "Preview must not create commits or reset the slider")
+        }
+        engine.finishLayerOpacityEdit()
+        XCTAssertEqual(engine.revision, revision + 1)
+        engine.undo(); XCTAssertEqual(engine.selectedLayer?.properties.opacity, 1)
+        engine.redo(); XCTAssertEqual(engine.selectedLayer?.properties.opacity, 0.3)
+        engine.undo(); engine.undo()
+        XCTAssertTrue(try engine.snapshot().layers[0].pixels.allSatisfy { $0 == 0 })
+    }
+    func testClippingGroupPreservesBaseAlphaAndAppliesBaseOpacityOnce() async throws {
+        let engine = try makeEngine()
+        var base = LayerProperties(name: "半透明の基底"); base.opacity = 0.5
+        let basePixels = Data(Array(repeating: [UInt8(128), 0, 0, 128], count: 64 * 64).flatMap { $0 })
+        var layers = [LayerSnapshot(properties: base, pixels: basePixels)]
+        for index in 0..<3 {
+            var clip = LayerProperties(name: "クリップ\(index)"); clip.clipping = true
+            layers.append(.init(properties: clip, pixels: Data(Array(repeating: [UInt8(0), 0, 255, 255], count: 64 * 64).flatMap { $0 })))
+        }
+        try engine.load(.init(width: 64, height: 64, layers: layers, selectedLayerID: base.id))
+        let pixel = try compositePixel(engine)
+        XCTAssertEqual(Double(pixel[3]), 64, accuracy: 1)
+        XCTAssertEqual(Double(pixel[2]), 64, accuracy: 1)
+        engine.changeLayer(base.id) { $0.visible = false }
+        XCTAssertEqual(try compositePixel(engine)[3], 0)
+    }
+    func testLayerInsertionAndReorderKeepClippingValidThroughUndo() async throws {
+        let engine = try makeEngine(), base = engine.layers[0].id
+        engine.changeLayer(base) { $0.clipping = true }
+        XCTAssertFalse(engine.layers[0].properties.clipping)
+        engine.addLayer(); let clip = try XCTUnwrap(engine.selectedLayerID)
+        engine.changeLayer(clip) { $0.clipping = true }
+        engine.selectedLayerID = base; engine.addLayer()
+        XCTAssertTrue(engine.layers[1].properties.clipping)
+        let inserted = try XCTUnwrap(engine.selectedLayerID)
+        engine.reorderLayer(clip, to: 0)
+        XCTAssertEqual(engine.layers[0].id, clip); XCTAssertFalse(engine.layers[0].properties.clipping)
+        engine.undo()
+        XCTAssertEqual(engine.layers.map(\.id), [base, inserted, clip]); XCTAssertTrue(engine.layers[2].properties.clipping)
+        engine.selectedLayerID = base; engine.deleteLayer()
+        XCTAssertFalse(engine.layers[0].properties.clipping)
+        engine.undo()
+        XCTAssertEqual(engine.layers.map(\.id), [base, inserted, clip]); XCTAssertTrue(engine.layers[1].properties.clipping)
+    }
     func testImageImportKeepsTopToBottomOrientation() async throws {
         let engine = try makeEngine()
         stroke(engine, from: .init(20, 10), to: .init(40, 10))
