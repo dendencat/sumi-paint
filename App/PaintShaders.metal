@@ -71,6 +71,28 @@ kernel void clearRegion(texture2d<float, access::write> output [[texture(0)]],
     uint2 point = origin + gid;
     if (point.x < output.get_width() && point.y < output.get_height()) output.write(float4(0), point);
 }
+
+// Downsample directly into the small readback texture. Letterbox rectangular
+// canvases and average linear samples to retain thin marks when reducing.
+kernel void thumbnailLayer(texture2d<float, access::sample> source [[texture(0)]],
+                           texture2d<float, access::write> output [[texture(1)]],
+                           uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= output.get_width() || gid.y >= output.get_height()) return;
+    float2 canvas = float2(source.get_width(), source.get_height());
+    float2 size = float2(output.get_width(), output.get_height());
+    float2 fitted = canvas * min(size.x / canvas.x, size.y / canvas.y);
+    float2 pixel = float2(gid) + 0.5f - (size - fitted) * 0.5f;
+    if (any(pixel < 0) || any(pixel >= fitted)) { output.write(float4(0), gid); return; }
+    constexpr sampler sample(filter::linear, address::clamp_to_edge);
+    float4 color = float4(0);
+    for (uint y = 0; y < 4; ++y) {
+        for (uint x = 0; x < 4; ++x) {
+            float2 offset = (float2(x, y) + 0.5f) / 4.0f - 0.5f;
+            color += source.sample(sample, (pixel + offset) / fitted);
+        }
+    }
+    output.write(color / 16.0f, gid);
+}
 kernel void compositeLayer(texture2d<float, access::read> destination [[texture(0)]],
                            texture2d<float, access::read> source [[texture(1)]],
                            texture2d<float, access::read> clipBase [[texture(2)]],

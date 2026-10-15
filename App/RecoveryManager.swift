@@ -30,7 +30,7 @@ struct RecoveryManager: View {
                     }
                 }
             }
-            Text("編集中の作品を除き、最新5件・7日以内・合計256MBまで保持します。未保存の作品はここから開けます。")
+            Text("確認済みの復旧版は最新5件・7日以内・合計256MBを目安に整理します。未確認の版と編集中の作品は上限を超えても保持します。")
                 .font(.caption).foregroundStyle(.secondary).padding(8)
             }
             .navigationTitle("復旧ファイル")

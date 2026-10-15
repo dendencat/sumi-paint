@@ -138,9 +138,7 @@ final class EditorModel: ObservableObject {
     private func pruneRecoveries() {
         var protected = protectedRecoveryURLs
         for model in RecoverySessions.shared.active { protected.formUnion(model.protectedRecoveryURLs) }
-        // Only the current checkpoint needs protection; older documents remain
-        // recoverable within the same bounded retention policy as prior sessions.
-        do { try RecoveryCatalog.prune(in: recoveryFolder, protected: protected) }
+        do { try RecoveryCatalog.prune(in: recoveryFolder, protected: protected, acknowledged: acknowledgedRecoveries) }
         catch { engine?.errorMessage = "古い復旧ファイルを整理できません: \(error.localizedDescription)" }
     }
     func acknowledgeRecovery(_ url: URL) {

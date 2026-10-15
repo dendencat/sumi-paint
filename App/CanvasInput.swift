@@ -53,6 +53,14 @@ final class CanvasPointer {
     }
     func undoIncludingStroke() { end(); engine.undo() }
     func undoGesture() { end(cancelled: true); engine.undo() }
+    /// Finger navigation may discard provisional finger ink, but must never
+    /// cancel or change the viewport under an active Pencil stroke.
+    @discardableResult
+    func beginNavigationGesture(pencilActive: Bool) -> Bool {
+        guard !pencilActive else { return false }
+        end(cancelled: true)
+        return true
+    }
 }
 
 struct PaintCanvas: View {
@@ -130,7 +138,7 @@ final class TouchCanvas: MTKView, MTKViewDelegate, UIGestureRecognizerDelegate {
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
     func draw(in view: MTKView) { engine.render(in: view) }
     override func gestureRecognizerShouldBegin(_ recognizer: UIGestureRecognizer) -> Bool {
-        guard !engine.isBusy else { return false }
+        guard !engine.isBusy, activeTouch?.type != .pencil else { return false }
         if let pan = recognizer as? UIPanGestureRecognizer, pan.maximumNumberOfTouches == 1 {
             return engine.tool == .hand || !engine.fingerDrawing
         }
@@ -140,33 +148,43 @@ final class TouchCanvas: MTKView, MTKViewDelegate, UIGestureRecognizerDelegate {
         !(recognizer is UITapGestureRecognizer) && !(other is UITapGestureRecognizer)
     }
     @objc private func pan(_ recognizer: UIPanGestureRecognizer) {
-        if recognizer.state == .began { pointer.end(cancelled: true); activeTouch = nil }
+        guard activeTouch?.type != .pencil else { recognizer.setTranslation(.zero, in: self); return }
+        if recognizer.state == .began { pointer.beginNavigationGesture(pencilActive: false); activeTouch = nil }
         let translation = recognizer.translation(in: self)
         engine.viewport.pan.x += Double(translation.x); engine.viewport.pan.y += Double(translation.y)
         recognizer.setTranslation(.zero, in: self); setNeedsDisplay()
     }
     @objc private func pinch(_ recognizer: UIPinchGestureRecognizer) {
-        if recognizer.state == .began { pointer.end(cancelled: true); activeTouch = nil }
+        guard activeTouch?.type != .pencil else { recognizer.scale = 1; return }
+        if recognizer.state == .began { pointer.beginNavigationGesture(pencilActive: false); activeTouch = nil }
         let anchor = recognizer.location(in: self)
         engine.viewport.zoom(by: Double(recognizer.scale), around: .init(Double(anchor.x), Double(anchor.y)))
         recognizer.scale = 1; setNeedsDisplay()
     }
     @objc private func rotate(_ recognizer: UIRotationGestureRecognizer) {
-        if recognizer.state == .began { pointer.end(cancelled: true); activeTouch = nil }
+        guard activeTouch?.type != .pencil else { recognizer.rotation = 0; return }
+        if recognizer.state == .began { pointer.beginNavigationGesture(pencilActive: false); activeTouch = nil }
         engine.viewport.angle += Double(recognizer.rotation); recognizer.rotation = 0; setNeedsDisplay()
     }
-    @objc private func twoFingerTap() { pointer.undoGesture(); activeTouch = nil }
+    @objc private func twoFingerTap() {
+        guard activeTouch?.type != .pencil else { return }
+        pointer.undoGesture(); activeTouch = nil
+    }
     private func pressure(_ touch: UITouch) -> Double? {
         guard touch.type == .pencil, touch.maximumPossibleForce > 0, touch.force > 0 else { return nil }
         return min(1, Double(touch.force / touch.maximumPossibleForce))
     }
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        let pencil = touches.first(where: { $0.type == .pencil })
         let fingers = event?.allTouches?.filter { $0.type == .direct && ($0.phase == .began || $0.phase == .moved || $0.phase == .stationary) }.count ?? 0
-        if fingers > 1, activeTouch?.type != .pencil {
+        if activeTouch?.type != .pencil, pencil != nil {
+            pointer.end(cancelled: true); activeTouch = nil
+        }
+        if fingers > 1, activeTouch?.type != .pencil, pencil == nil {
             pointer.end(cancelled: true); activeTouch = nil; return
         }
         guard activeTouch == nil, !engine.isBusy,
-              let touch = touches.first(where: { $0.type == .pencil || (engine.fingerDrawing && engine.tool != .hand) }) else { return }
+              let touch = pencil ?? touches.first(where: { $0.type == .direct && engine.fingerDrawing && engine.tool != .hand }) else { return }
         activeTouch = touch
         let point = touch.location(in: self)
         pointer.begin(point: .init(Double(point.x), Double(point.y)), time: touch.timestamp, pressure: pressure(touch))

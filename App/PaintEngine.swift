@@ -1,6 +1,8 @@
 import Foundation
 import Combine
-import MetalKit
+// Metal resources may cross to their command's completion queue. The thumbnail
+// readback texture is read only after that command completes and is never reused.
+@preconcurrency import MetalKit
 import ImageIO
 import UniformTypeIdentifiers
 
@@ -26,6 +28,8 @@ enum EditorTool: String, CaseIterable, Sendable {
 final class PaintLayer: Identifiable {
     var properties: LayerProperties
     let texture: MTLTexture
+    let instanceID = UUID()
+    var pixelRevision: UInt64 = 0
     var id: UUID { properties.id }
     init(properties: LayerProperties, texture: MTLTexture) { self.properties = properties; self.texture = texture }
 }
@@ -76,6 +80,7 @@ final class PaintEngine: ObservableObject {
     let viewPipeline: MTLRenderPipelineState
     private let clearPipeline: MTLComputePipelineState
     private let compositePipeline: MTLComputePipelineState
+    private let thumbnailPipeline: MTLComputePipelineState
     @Published private(set) var layers: [PaintLayer] = []
     @Published var selectedLayerID: UUID?
     @Published var tool: EditorTool = .pen
@@ -131,7 +136,13 @@ final class PaintEngine: ObservableObject {
     private var strokeBase: MTLTexture!
     private var strokeCoverage: MTLTexture!
     private var opacityEdit: (id: UUID, before: LayerProperties)?
-    private var thumbnails: [UUID: CGImage] = [:]
+    private var thumbnails: [UUID: (revision: UInt64, image: CGImage)] = [:]
+    private var pendingThumbnails: Set<UUID> = []
+    private var thumbnailRefreshTask: Task<Void, Never>?
+    #if DEBUG
+    private(set) var thumbnailGenerationCount = 0
+    private(set) var thumbnailReadbackBytes = 0
+    #endif
     private var dirty: MTLRegion?
     private var undoRecords: [EditRecord] = []
     private var redoRecords: [EditRecord] = []
@@ -150,7 +161,8 @@ final class PaintEngine: ObservableObject {
               let display = library.makeFunction(name: "canvasFragment"),
               let clear = library.makeFunction(name: "clearRegion"),
               let compose = library.makeFunction(name: "compositeLayer"),
-              let resolve = library.makeFunction(name: "resolveStroke") else {
+              let resolve = library.makeFunction(name: "resolveStroke"),
+              let thumbnail = library.makeFunction(name: "thumbnailLayer") else {
             throw PaintDocumentError.invalid("Metal描画機能を初期化できません。")
         }
         self.device = device; self.queue = queue
@@ -167,6 +179,7 @@ final class PaintEngine: ObservableObject {
         viewPipeline = try device.makeRenderPipelineState(descriptor: viewDescription)
         clearPipeline = try device.makeComputePipelineState(function: clear)
         compositePipeline = try device.makeComputePipelineState(function: compose)
+        thumbnailPipeline = try device.makeComputePipelineState(function: thumbnail)
         for key in ["palette.recent", "palette.saved"] {
             if let data = defaults.data(forKey: key), let colors = try? JSONDecoder().decode([PaintColor].self, from: data) {
                 let valid = colors.filter(\.isValid)
@@ -285,6 +298,7 @@ final class PaintEngine: ObservableObject {
         documentID = UUID(); resetEditingState(); commit()
     }
     private func resetEditingState() {
+        thumbnails.removeAll()
         cancellationPending = false
         undoRecords = []; redoRecords = []; canUndo = false; canRedo = false
         selectionMask = nil; hasSelection = false; processor = nil; strokeLayer = nil; beforeTiles = [:]
@@ -327,12 +341,12 @@ final class PaintEngine: ObservableObject {
 
     func setTool(_ value: EditorTool) {
         guard !strokeActive, tool != value else { return }
-        if tool.isBrush { toolBrushes[tool] = brush }
+        if tool.isBrush || tool == .fill { toolBrushes[tool] = brush }
         if tool == .pen || tool == .pencil {
             rememberedDrawingTool = tool; rememberedDrawingBrush = brush
         }
         tool = value
-        if value.isBrush {
+        if value.isBrush || value == .fill {
             var initial = BrushSettings()
             initial.kind = value == .eraser ? .eraser : (value == .pencil ? .pencil : .pen)
             initial.hardness = value == .pencil ? 0.6 : 0.85
@@ -404,6 +418,7 @@ final class PaintEngine: ObservableObject {
         }
         cancellationPending = false
         processor = nil; strokeLayer = nil; beforeTiles = [:]; requestDisplay?()
+        scheduleThumbnails()
     }
     func retryPendingCancellation() { if cancellationPending { endStroke(cancelled: true) } }
     private func editableLayer() -> PaintLayer? {
@@ -470,6 +485,7 @@ final class PaintEngine: ObservableObject {
         dispatch(resolve, pipeline: strokePipeline, region: bounds); resolve.endEncoding()
         guard submit(command) else { return }
         gpuWrittenTextures[ObjectIdentifier(layer.texture)] = layer.texture
+        layer.pixelRevision &+= 1
         markDirty(bounds)
     }
 
@@ -557,7 +573,11 @@ final class PaintEngine: ObservableObject {
         encoder.endEncoding(); command.present(drawable); submit(command)
     }
 
-    private func commit() { thumbnails.removeAll(); revision &+= 1; onCommit?(); requestDisplay?() }
+    private func commit() {
+        thumbnails = thumbnails.filter { id, _ in layers.contains { $0.id == id } }
+        scheduleThumbnails()
+        revision &+= 1; onCommit?(); requestDisplay?()
+    }
     private func record(_ value: EditRecord) {
         redoRecords.removeAll(); undoRecords.append(value)
         while undoRecords.reduce(0, { $0 + $1.byteCost }) > historyBudget || undoRecords.count > 100 { undoRecords.removeFirst() }
@@ -598,7 +618,9 @@ final class PaintEngine: ObservableObject {
         blit.endEncoding()
         guard submit(command) else { return false }
         gpuWrittenTextures[ObjectIdentifier(layer.texture)] = layer.texture
-        return waitForGPU()
+        guard waitForGPU() else { return false }
+        layer.pixelRevision &+= 1
+        return true
     }
     private func apply(_ record: EditRecord, forward: Bool) -> Bool {
         switch record {
@@ -704,20 +726,76 @@ final class PaintEngine: ObservableObject {
         record(.properties(edit.id, edit.before, layer.properties)); commit()
     }
     func thumbnail(for layer: PaintLayer) -> CGImage? {
-        if let cached = thumbnails[layer.id] { return cached }
-        guard !strokeActive, waitForGPU() else { return nil }
-        let data = read(layer.texture)
-        guard let provider = CGDataProvider(data: data as CFData),
-              let image = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
-                bytesPerRow: width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
-                provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent),
-              let context = CGContext(data: nil, width: 80, height: 80, bitsPerComponent: 8, bytesPerRow: 320,
-                space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
-        let scale = min(80.0 / Double(width), 80.0 / Double(height))
-        let w = Double(width) * scale, h = Double(height) * scale
-        context.draw(image, in: CGRect(x: (80-w)/2, y: (80-h)/2, width: w, height: h))
-        let result = context.makeImage(); thumbnails[layer.id] = result; return result
+        // SwiftUI only reads the cache. Keep the last image while a replacement
+        // is pending; never wait for the GPU or publish errors during view updates.
+        thumbnails[layer.id]?.image
+    }
+    private func scheduleThumbnails() {
+        guard thumbnailRefreshTask == nil else { return }
+        thumbnailRefreshTask = Task { [weak self] in
+            // Coalesce rapid commits without regenerating during an active stroke.
+            try? await Task.sleep(for: .milliseconds(100))
+            guard let self else { return }
+            thumbnailRefreshTask = nil
+            guard !strokeActive, !isBusy, gpuFailure == nil else { return }
+            for layer in layers where thumbnails[layer.id]?.revision != layer.pixelRevision {
+                generateThumbnail(for: layer)
+            }
+        }
+    }
+    private func generateThumbnail(for layer: PaintLayer) {
+        let identity = layer.instanceID, version = layer.pixelRevision
+        guard !pendingThumbnails.contains(identity) else { return }
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: 80, height: 80, mipmapped: false)
+        descriptor.usage = [.shaderWrite]
+        #if os(macOS)
+        descriptor.storageMode = device.hasUnifiedMemory ? .shared : .managed
+        #else
+        descriptor.storageMode = .shared
+        #endif
+        guard let texture = device.makeTexture(descriptor: descriptor),
+              let command = queue.makeCommandBuffer(), let encoder = command.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(thumbnailPipeline)
+        encoder.setTexture(layer.texture, index: 0); encoder.setTexture(texture, index: 1)
+        dispatch(encoder, pipeline: thumbnailPipeline, region: MTLRegionMake2D(0, 0, 80, 80))
+        encoder.endEncoding()
+        #if os(macOS)
+        if texture.storageMode == .managed {
+            guard let blit = command.makeBlitCommandEncoder() else { return }
+            blit.synchronize(resource: texture); blit.endEncoding()
+        }
+        #endif
+        command.addCompletedHandler { [weak self] completed in
+            let image: CGImage?
+            if completed.status == .completed {
+                // Only 25.6 KB crosses back to the CPU, on the completion queue.
+                var data = Data(count: 80 * 80 * 4)
+                data.withUnsafeMutableBytes {
+                    texture.getBytes($0.baseAddress!, bytesPerRow: 320, from: MTLRegionMake2D(0, 0, 80, 80), mipmapLevel: 0)
+                }
+                image = CGDataProvider(data: data as CFData).flatMap { provider in
+                    CGImage(width: 80, height: 80, bitsPerComponent: 8, bitsPerPixel: 32,
+                        bytesPerRow: 320, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue),
+                        provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+                }
+            } else { image = nil }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                pendingThumbnails.remove(identity)
+                checkCompletion(completed)
+                guard let layer = layers.first(where: { $0.instanceID == identity }) else { return }
+                guard layer.pixelRevision == version else { scheduleThumbnails(); return }
+                guard let image, gpuFailure == nil else { return }
+                objectWillChange.send()
+                thumbnails[layer.id] = (version, image)
+                #if DEBUG
+                thumbnailGenerationCount += 1; thumbnailReadbackBytes += 80 * 80 * 4
+                #endif
+            }
+        }
+        pendingThumbnails.insert(identity)
+        if !submit(command) { pendingThumbnails.remove(identity) }
     }
     func changeLayer(_ id: UUID, _ change: (inout LayerProperties) -> Void) {
         guard gpuFailure == nil, !strokeActive, !isBusy, let layer = layers.first(where: { $0.id == id }) else { return }
@@ -774,6 +852,7 @@ final class PaintEngine: ObservableObject {
             let after = allPatches(layer.texture)
             var changedBefore: [TilePatch] = [], changedAfter: [TilePatch] = []
             for (a, b) in zip(before, after) where a.data != b.data { changedBefore.append(a); changedAfter.append(b) }
+            if !changedBefore.isEmpty { layer.pixelRevision &+= 1 }
             let changedMask = oldMask != result.mask
             if !changedBefore.isEmpty || changedMask {
                 record(.pixels(layer.id, changedBefore, changedAfter, changedMask ? oldMask : nil, changedMask ? result.mask : nil))

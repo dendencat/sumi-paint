@@ -19,13 +19,21 @@ public enum RecoveryCatalog {
                 return RecoveryEntry(url: url, modified: values.contentModificationDate ?? .distantPast, bytes: values.fileSize ?? 0)
             }.sorted { $0.modified > $1.modified }
     }
-    /// Keep a bounded, recent set of checkpoints. Active sessions are protected.
+    /// Apply retention only to acknowledged versions. Unreviewed and active
+    /// checkpoints survive even when they exceed the age, count or byte limits.
     public static func prune(in folder: URL, maximumEntries: Int = 5,
                              maximumAge: TimeInterval = 7 * 24 * 60 * 60,
                              maximumBytes: Int = 256 * 1024 * 1024,
-                             now: Date = .now, protected: Set<URL> = []) throws {
+                             now: Date = .now, protected: Set<URL> = [],
+                             acknowledged: [String: Double] = [:]) throws {
         let candidates = try entries(in: folder)
-        let protectedPaths = Set(protected.map { $0.standardizedFileURL.path })
+        var protectedPaths = Set(protected.map { $0.standardizedFileURL.path })
+        for entry in candidates {
+            let path = entry.url.standardizedFileURL.path
+            if acknowledged[path].map({ $0 >= entry.modified.timeIntervalSince1970 }) != true {
+                protectedPaths.insert(path)
+            }
+        }
         let active = candidates.filter { protectedPaths.contains($0.url.standardizedFileURL.path) }
         var kept = active.count, bytes = active.reduce(0) { $0 + $1.bytes }
         for entry in candidates where !protectedPaths.contains(entry.url.standardizedFileURL.path) {

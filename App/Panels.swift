@@ -214,12 +214,20 @@ struct HSVColorControl: View {
     }
 }
 
+private struct LayerDragItem: Codable, Transferable {
+    let documentID: UUID
+    let layerID: UUID
+    private static let contentType = UTType(exportedAs: "app.dendencat.sumipaint.layer", conformingTo: .data)
+    static var transferRepresentation: some TransferRepresentation {
+        CodableRepresentation(contentType: contentType)
+    }
+}
+
 struct LayerPanel: View {
     @ObservedObject var engine: PaintEngine
     @State private var editingID: UUID?
     @State private var name = ""
-    @State private var draggedID: UUID?
-    @FocusState private var nameFocused: Bool
+    @FocusState private var focusedNameID: UUID?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -268,8 +276,13 @@ struct LayerPanel: View {
         }
         .font(.caption)
         .disabled(engine.isBusy || engine.strokeActive)
-        .onChange(of: engine.selectedLayerID) { _, _ in finishName(); engine.finishLayerOpacityEdit() }
-        .onChange(of: nameFocused) { _, focused in if !focused { finishName() } }
+        .onChange(of: engine.selectedLayerID) { _, selected in
+            if editingID != selected { finishName() }
+            engine.finishLayerOpacityEdit()
+        }
+        .onChange(of: focusedNameID) { previous, focused in
+            if previous == editingID, focused != editingID { finishName() }
+        }
         .onDisappear { finishName(); engine.finishLayerOpacityEdit() }
     }
     private func layerRow(_ layer: PaintLayer) -> some View {
@@ -286,8 +299,13 @@ struct LayerPanel: View {
                 }
             }.frame(width: 40, height: 40).clipped().accessibilityLabel("\(layer.properties.name)のサムネイル")
             if editingID == layer.id {
-                TextField("レイヤー名", text: $name).textFieldStyle(.plain).focused($nameFocused)
+                TextField("レイヤー名", text: $name).textFieldStyle(.plain).focused($focusedNameID, equals: layer.id)
                     .onSubmit { finishName() }
+                    .task {
+                        await Task.yield()
+                        guard !Task.isCancelled, editingID == layer.id, engine.selectedLayerID == layer.id else { return }
+                        focusedNameID = layer.id
+                    }
             } else {
                 Text(layer.properties.name).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
                     .onTapGesture(count: 2) { beginName(layer) }
@@ -303,20 +321,21 @@ struct LayerPanel: View {
         .overlay(alignment: .leading) { if selected { Rectangle().fill(.mint).frame(width: 3) } }
         .contentShape(Rectangle()).onTapGesture { engine.selectedLayerID = layer.id }
         .accessibilityAddTraits(selected ? .isSelected : [])
-        .onDrag { draggedID = layer.id; return NSItemProvider(object: layer.id.uuidString as NSString) }
-        .onDrop(of: [.plainText], isTargeted: nil) { providers in
-            guard !providers.isEmpty, let id = draggedID,
+        .draggable(LayerDragItem(documentID: engine.documentID, layerID: layer.id))
+        .dropDestination(for: LayerDragItem.self) { items, _ in
+            guard items.count == 1, let item = items.first, item.documentID == engine.documentID,
+                  engine.layers.contains(where: { $0.id == item.layerID }),
                   let target = engine.layers.firstIndex(where: { $0.id == layer.id }) else { return false }
-            engine.reorderLayer(id, to: target); draggedID = nil; return true
+            engine.reorderLayer(item.layerID, to: target); return true
         }
     }
     private func beginName(_ layer: PaintLayer) {
         finishName(); engine.selectedLayerID = layer.id
-        name = layer.properties.name; editingID = layer.id; nameFocused = true
+        name = layer.properties.name; editingID = layer.id
     }
     private func finishName() {
         guard let id = editingID else { return }
-        editingID = nil; nameFocused = false
+        editingID = nil; focusedNameID = nil
         engine.changeLayer(id) { $0.name = name }
     }
     private func icon(_ image: String, label: String, action: @escaping () -> Void) -> some View {

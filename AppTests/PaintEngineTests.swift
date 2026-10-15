@@ -403,6 +403,104 @@ final class PaintEngineTests: XCTestCase {
         engine.undo(); XCTAssertTrue(try engine.snapshot().layers[0].pixels.allSatisfy { $0 == 0 })
         engine.redo(); XCTAssertEqual(try engine.snapshot().layers[0].pixels, filled)
     }
+    func testFillOpacitySurvivesToolChangesIndependently() async throws {
+        let engine = try makeEngine()
+        engine.brush.opacity = 0.2; let pen = engine.brush
+        engine.setTool(.eraser); engine.brush.opacity = 0.1
+        engine.setTool(.fill)
+        XCTAssertEqual(engine.brush.opacity, 1, "Fill must not inherit eraser opacity")
+        engine.brush.opacity = 0.4
+        engine.setTool(.eyedropper); engine.setTool(.pen)
+        XCTAssertEqual(engine.brush, pen)
+        engine.setTool(.fill)
+        XCTAssertEqual(engine.brush.opacity, 0.4)
+        engine.fill(at: .init(8, 8))
+        while engine.isBusy { await Task.yield() }
+        XCTAssertEqual(Double(try engine.snapshot().layers[0].pixels[3]), 102, accuracy: 1)
+        engine.setTool(.eraser); XCTAssertEqual(engine.brush.opacity, 0.1)
+    }
+
+    func testFingerNavigationPreservesPencilStrokeAndCancelsFingerInk() async throws {
+        let engine = try makeEngine(), pointer = CanvasPointer(engine: engine)
+        engine.viewport.viewWidth = 64; engine.viewport.viewHeight = 64; engine.viewport.zoom = 1
+        pointer.begin(point: .init(8, 32), time: 0, pressure: 1)
+        pointer.move(point: .init(56, 32), time: 1, pressure: 1)
+        XCTAssertFalse(pointer.beginNavigationGesture(pencilActive: true))
+        XCTAssertTrue(engine.strokeActive)
+        pointer.end()
+        let pencilPixels = try engine.snapshot().layers[0].pixels
+        XCTAssertTrue(pencilPixels.contains { $0 != 0 })
+        pointer.begin(point: .init(8, 48), time: 2, pressure: nil)
+        pointer.move(point: .init(56, 48), time: 3, pressure: nil)
+        XCTAssertTrue(pointer.beginNavigationGesture(pencilActive: false))
+        XCTAssertFalse(engine.strokeActive)
+        XCTAssertEqual(try engine.snapshot().layers[0].pixels, pencilPixels)
+    }
+
+    private func waitForThumbnail(_ engine: PaintEngine, layer: PaintLayer, after count: Int) async throws -> CGImage {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while engine.thumbnailGenerationCount <= count || engine.thumbnail(for: layer) == nil {
+            guard ContinuousClock.now < deadline else { throw PaintDocumentError.invalid("Thumbnail generation timed out") }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        return try XCTUnwrap(engine.thumbnail(for: layer))
+    }
+    func testThumbnailsReadSmallTexturesAndOnlyRefreshChangedPixels() async throws {
+        let engine = try makeEngine(), base = try XCTUnwrap(engine.selectedLayer)
+        _ = try await waitForThumbnail(engine, layer: base, after: 0)
+        engine.addLayer(); let top = try XCTUnwrap(engine.selectedLayer)
+        let original = try await waitForThumbnail(engine, layer: top, after: 1)
+        let count = engine.thumbnailGenerationCount, bytes = engine.thumbnailReadbackBytes
+        XCTAssertEqual(count, 2)
+        XCTAssertEqual(bytes, count * 80 * 80 * 4)
+        engine.changeLayer(top.id) { $0.name = "新しい名前"; $0.opacity = 0.5 }
+        engine.reorderLayer(top.id, to: 0)
+        engine.undo(); engine.redo()
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(engine.thumbnailGenerationCount, count, "Metadata and ordering do not alter pixel thumbnails")
+        XCTAssertTrue(engine.thumbnail(for: top) === original)
+        engine.selectedLayerID = top.id
+        stroke(engine, from: .init(8, 32), to: .init(56, 32))
+        let ink = try await waitForThumbnail(engine, layer: top, after: count)
+        XCTAssertFalse(ink === original)
+        XCTAssertEqual(engine.thumbnailGenerationCount, count + 1)
+        XCTAssertEqual(engine.thumbnailReadbackBytes - bytes, 80 * 80 * 4)
+        XCTAssertTrue(try XCTUnwrap(ink.dataProvider?.data as Data?).contains { $0 != 0 })
+        engine.undo()
+        let blank = try await waitForThumbnail(engine, layer: top, after: count + 1)
+        XCTAssertTrue(try XCTUnwrap(blank.dataProvider?.data as Data?).allSatisfy { $0 == 0 })
+        engine.redo()
+        _ = try await waitForThumbnail(engine, layer: top, after: count + 2)
+        engine.failNextGPUCompletion = true
+        _ = engine.thumbnail(for: base)
+        XCTAssertTrue(engine.failNextGPUCompletion, "View reads must not wait for GPU completion")
+        XCTAssertNil(engine.errorMessage)
+        engine.failNextGPUCompletion = false
+    }
+
+    func testStartupAndAutosavePreserveOldUnreviewedRecoveries() async throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let suite = "SumiPaintTests.OldRecovery.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: folder) }
+        let engine = try makeEngine(), snapshot = try engine.snapshot(), writer = RecoveryWriter()
+        for index in 0..<7 {
+            let url = folder.appendingPathComponent("old-\(index).sumipaint")
+            try await writer.write(snapshot, revision: 1, to: url)
+            try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-8 * 86400 - Double(index))], ofItemAtPath: url.path)
+        }
+        let originals = try RecoveryCatalog.entries(in: folder).map(\.url)
+        let model = EditorModel(recoveryFolder: folder, idleDelay: 100, defaults: defaults)
+        defer { model.cancelRecoveryForTesting(); model.acknowledgeCleanExit() }
+        XCTAssertEqual(Set(model.recoveryEntries.map(\.url)), Set(originals))
+        XCTAssertNotNil(model.recoveryURL)
+        let current = try XCTUnwrap(model.engine)
+        try current.newDocument(width: 64, height: 64)
+        stroke(current, from: .init(8, 32), to: .init(56, 32))
+        let saved = await model.saveRecovery(); XCTAssertTrue(saved)
+        XCTAssertEqual(try RecoveryCatalog.entries(in: folder).count, 8)
+        for url in originals { XCTAssertEqual(try DocumentSnapshot.decode(Data(contentsOf: url)), snapshot) }
+    }
     private func recoveryModel() throws -> (EditorModel, URL) {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let suite = "SumiPaintTests.RecoveryModel.\(UUID().uuidString)"

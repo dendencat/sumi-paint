@@ -242,10 +242,14 @@ private struct EditorWorkspace: View {
         HStack(spacing: 8) {
             Circle().fill(Color(red: engine.color.red, green: engine.color.green, blue: engine.color.blue))
                 .frame(width: 24, height: 24).onTapGesture { panel = .color }.accessibilityLabel("現在の色")
-            Text("\(Int(engine.brush.size))px").font(.caption.monospacedDigit()).frame(width: 42)
-            Slider(value: $engine.brush.size, in: 1...512, step: 1).frame(maxWidth: 220).accessibilityLabel("ブラシサイズ")
-            Text("\(Int(engine.brush.opacity * 100))%").font(.caption.monospacedDigit()).frame(width: 36)
-            Slider(value: $engine.brush.opacity, in: 0.01...1).frame(maxWidth: 100).accessibilityLabel("不透明度")
+            if engine.tool.isBrush {
+                Text("\(Int(engine.brush.size))px").font(.caption.monospacedDigit()).frame(width: 42)
+                Slider(value: $engine.brush.size, in: 1...512, step: 1).frame(maxWidth: 220).accessibilityLabel("ブラシサイズ")
+            }
+            if engine.tool.isBrush || engine.tool == .fill {
+                Text("\(Int(engine.brush.opacity * 100))%").font(.caption.monospacedDigit()).frame(width: 36)
+                Slider(value: $engine.brush.opacity, in: 0.01...1).frame(maxWidth: 100).accessibilityLabel("不透明度")
+            }
             #if os(macOS)
             Spacer(minLength: 0)
             #endif
