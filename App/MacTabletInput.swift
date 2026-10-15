@@ -135,7 +135,7 @@ struct MacTabletPanel: View {
             Divider()
             VStack(alignment: .leading, spacing: 12) {
                 Text("キーを割り当てる場合").font(.headline)
-                Text("B: ペン　P: 鉛筆　E: 消しゴム　H: 移動\nX: 描画ツールと消しゴムを切り替え\nSpace: 押している間移動　Option: 押している間スポイト\nCommand-Z: 元に戻す　Command-Shift-Z: やり直す")
+                Text("B: ペン　P: 鉛筆　E: 消しゴム　H: 移動\nX: 描画色と背景色を入れ替え\nSpace: 押している間移動　Option: 押している間スポイト\nCommand-Z: 元に戻す　Command-Shift-Z: やり直す")
                     .font(.caption)
                 Text("文字入力中は文字入力を優先します。ボタンを使う前にキャンバスをクリックしてください。")
                     .font(.caption).foregroundStyle(.secondary)

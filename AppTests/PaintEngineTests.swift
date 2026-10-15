@@ -74,17 +74,31 @@ final class PaintEngineTests: XCTestCase {
         canvas.updateTabletProximity(isEntering: false, eraser: true)
         XCTAssertEqual(engine.tool, .pencil); XCTAssertEqual(engine.brush, original)
     }
-    func testToggleKeyPreservesPencilAndIgnoresKeyRepeat() async throws {
+    func testXSwapsColorsAndIgnoresRepeatWithoutChangingTool() async throws {
         let engine = try makeEngine()
         let canvas = MouseCanvas(engine: engine, tabletSettings: tabletSettings())
-        engine.setTool(.pencil); engine.brush.hardness = 0.22
-        let original = engine.brush
+        engine.setTool(.pencil); let original = engine.color
         canvas.keyDown(with: try keyEvent("x", code: 7))
-        XCTAssertEqual(engine.tool, .eraser)
+        XCTAssertEqual(engine.color, .init(1, 1, 1)); XCTAssertEqual(engine.backgroundColor, original)
         canvas.keyDown(with: try keyEvent("x", code: 7, repeatKey: true))
-        XCTAssertEqual(engine.tool, .eraser)
+        XCTAssertEqual(engine.color, .init(1, 1, 1))
         canvas.keyDown(with: try keyEvent("x", code: 7))
-        XCTAssertEqual(engine.tool, .pencil); XCTAssertEqual(engine.brush, original)
+        XCTAssertEqual(engine.color, original); XCTAssertEqual(engine.tool, .pencil)
+    }
+    func testPaletteSeparatesSelectionFromUseAndPersistsSets() async throws {
+        let suite = "SumiPaintTests.Palette.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let engine = try PaintEngine(defaults: defaults)
+        for index in 0..<20 { engine.setColor(.init(Double(index) / 20, 0, 0)) }
+        XCTAssertTrue(engine.recentColors.isEmpty)
+        engine.saveColor(); let saved = engine.color
+        for index in 0..<12 { engine.setColor(.init(0, Double(index) / 12, 0)); engine.rememberColor() }
+        XCTAssertEqual(engine.recentColors.count, 8); XCTAssertEqual(engine.colorSet, [saved])
+        let restored = try PaintEngine(defaults: defaults)
+        XCTAssertEqual(restored.recentColors, engine.recentColors); XCTAssertEqual(restored.colorSet, [saved])
+        restored.removeSavedColor(saved)
+        XCTAssertTrue(try PaintEngine(defaults: defaults).colorSet.isEmpty)
     }
     func testSpaceDuringStrokeCommitsInkAndFocusLossClearsMode() async throws {
         let engine = try makeEngine()

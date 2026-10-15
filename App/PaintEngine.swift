@@ -83,8 +83,11 @@ final class PaintEngine: ObservableObject {
     @Published var brush = BrushSettings()
     private(set) var rememberedDrawingTool: EditorTool = .pen
     private(set) var rememberedDrawingBrush = BrushSettings()
+    private let colorDefaults: UserDefaults
+    @Published var backgroundColor = PaintColor(1, 1, 1)
+    @Published private(set) var colorSet: [PaintColor] = [] { didSet { persistColors(colorSet, key: "palette.saved") } }
     @Published var color = PaintColor.ink
-    @Published var recentColors: [PaintColor] = [.ink, .init(0.87, 0.29, 0.38), .init(0.26, 0.5, 0.8), .init(0.2, 0.65, 0.5)]
+    @Published private(set) var recentColors: [PaintColor] = [] { didSet { persistColors(recentColors, key: "palette.recent") } }
     @Published var viewport = CanvasViewport()
     @Published var checkerboard = false
     @Published var fingerDrawing = false
@@ -134,7 +137,8 @@ final class PaintEngine: ObservableObject {
     private var gpuWrittenTextures: [ObjectIdentifier: MTLTexture] = [:]
     private var inFlightCommandBuffers: [MTLCommandBuffer] = []
 
-    init() throws {
+    init(defaults: UserDefaults = .standard) throws {
+        colorDefaults = defaults
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue(),
               let library = device.makeDefaultLibrary(),
               let vertex = library.makeFunction(name: "brushVertex"),
@@ -166,6 +170,13 @@ final class PaintEngine: ObservableObject {
         viewPipeline = try device.makeRenderPipelineState(descriptor: viewDescription)
         clearPipeline = try device.makeComputePipelineState(function: clear)
         compositePipeline = try device.makeComputePipelineState(function: compose)
+        for key in ["palette.recent", "palette.saved"] {
+            if let data = defaults.data(forKey: key), let colors = try? JSONDecoder().decode([PaintColor].self, from: data) {
+                let valid = colors.filter(\.isValid)
+                if key == "palette.recent" { recentColors = Array(valid.prefix(8)) }
+                else { colorSet = Array(valid.prefix(64)) }
+            }
+        }
         try newDocument(width: 1024, height: 1024)
     }
 
@@ -329,8 +340,25 @@ final class PaintEngine: ObservableObject {
         guard [value.red, value.green, value.blue, value.alpha].allSatisfy(\.isFinite) else { return }
         let clamped = PaintColor(min(1, max(0, value.red)), min(1, max(0, value.green)), min(1, max(0, value.blue)), min(1, max(0, value.alpha)))
         color = clamped
-        recentColors.removeAll { $0 == clamped }; recentColors.insert(clamped, at: 0)
-        if recentColors.count > 8 { recentColors.removeLast() }
+    }
+    private func persistColors(_ colors: [PaintColor], key: String) {
+        if let data = try? JSONEncoder().encode(colors) { colorDefaults.set(data, forKey: key) }
+    }
+    func rememberColor(_ value: PaintColor? = nil) {
+        let used = value ?? color
+        guard used.isValid else { return }
+        recentColors.removeAll { $0.hex == used.hex }; recentColors.insert(used, at: 0)
+        recentColors = Array(recentColors.prefix(8))
+    }
+    func saveColor(_ value: PaintColor? = nil) {
+        let saved = value ?? color
+        guard saved.isValid, !colorSet.contains(where: { $0.hex == saved.hex }), colorSet.count < 64 else { return }
+        colorSet.append(saved)
+    }
+    func removeSavedColor(_ value: PaintColor) { colorSet.removeAll { $0 == value } }
+    func swapColors() {
+        guard !strokeActive, !isBusy else { return }
+        let previous = color; setColor(backgroundColor); backgroundColor = previous
     }
     func beginStroke(_ sample: StrokeSample) {
         finishLayerOpacityEdit()
@@ -356,7 +384,7 @@ final class PaintEngine: ObservableObject {
             markDirty(fullRegion)
         } else if !before.isEmpty {
             let after = before.map { tile in patch(layer.texture, x: tile.x, y: tile.y, width: tile.width, height: tile.height) }
-            record(.pixels(layer.id, before, after, nil, nil)); commit()
+            record(.pixels(layer.id, before, after, nil, nil)); if strokeBrush.kind != .eraser { rememberColor(strokeColor) }; commit()
         }
         cancellationPending = false
         processor = nil; strokeLayer = nil; beforeTiles = [:]; requestDisplay?()

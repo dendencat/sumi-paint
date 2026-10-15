@@ -64,37 +64,147 @@ struct BrushPanel: View {
 
 struct ColorPanel: View {
     @ObservedObject var engine: PaintEngine
-    private var selectedColor: Binding<Color> {
-        Binding(get: { Color(red: engine.color.red, green: engine.color.green, blue: engine.color.blue) }, set: { value in
-            #if os(iOS)
-            var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
-            UIColor(value).getRed(&r, green: &g, blue: &b, alpha: &a)
-            engine.setColor(.init(Double(r), Double(g), Double(b)))
-            #else
-            if let color = NSColor(value).usingColorSpace(.sRGB) {
-                engine.setColor(.init(Double(color.redComponent), Double(color.greenComponent), Double(color.blueComponent)))
-            }
-            #endif
+    @State private var editingBackground = false
+    @State private var hex = ""
+    @State private var invalidHex = false
+    @FocusState private var hexFocused: Bool
+    private var activeColor: PaintColor { editingBackground ? engine.backgroundColor : engine.color }
+    private var selection: Binding<PaintColor> {
+        Binding(get: { activeColor }, set: { value in
+            if editingBackground { engine.backgroundColor = value } else { engine.setColor(value) }
         })
     }
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            ColorPicker("描画色", selection: selectedColor, supportsOpacity: false).font(.headline)
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 28))], spacing: 8) {
-                ForEach(Array(engine.recentColors.enumerated()), id: \.offset) { _, color in
-                    Button { engine.setColor(color) } label: {
-                        RoundedRectangle(cornerRadius: 7).fill(Color(red: color.red, green: color.green, blue: color.blue))
-                            .frame(height: 28).overlay(RoundedRectangle(cornerRadius: 7).stroke(.white.opacity(0.2)))
-                    }.buttonStyle(.plain).accessibilityLabel("最近使った色")
-                }
-            }
+        VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Button("黒") { engine.setColor(.ink) }
-                Button("白") { engine.setColor(.init(1, 1, 1)) }
+                Text("カラー").font(.headline)
                 Spacer()
-                Button { engine.setTool(.eyedropper) } label: { Image(systemName: "eyedropper") }.accessibilityLabel("スポイト")
-            }.buttonStyle(.bordered).font(.caption)
-        }.disabled(engine.isBusy)
+                ZStack {
+                    colorButton(engine.backgroundColor, title: "背景色", selected: editingBackground) { editingBackground = true }
+                        .offset(x: 10, y: 6)
+                    colorButton(engine.color, title: "描画色", selected: !editingBackground) { editingBackground = false }
+                        .offset(x: -10, y: -6)
+                }.frame(width: 56, height: 40)
+                Button { engine.swapColors() } label: { Image(systemName: "arrow.left.arrow.right") }
+                    .buttonStyle(.plain).help("描画色と背景色を入れ替え（X）").accessibilityLabel("描画色と背景色を入れ替え")
+            }
+            HSVColorControl(color: selection).frame(height: 168).frame(maxWidth: .infinity)
+            HStack {
+                Text(editingBackground ? "背景色 HEX" : "HEX").font(.caption)
+                TextField("#RRGGBB", text: $hex).font(.system(.caption, design: .monospaced))
+                    .textFieldStyle(.roundedBorder).focused($hexFocused).onSubmit(commitHex)
+                    .accessibilityLabel("HEXカラーコード")
+                Button { engine.setTool(.eyedropper) } label: { Image(systemName: "eyedropper") }
+                    .buttonStyle(.plain).help("スポイト").accessibilityLabel("スポイト")
+            }
+            if invalidHex { Text("6桁のHEXを入力してください").font(.caption2).foregroundStyle(.secondary) }
+            Text("最近使った色").font(.caption).foregroundStyle(.secondary)
+            swatches(engine.recentColors, saved: false)
+            HStack {
+                Text("カラーセット").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Button { engine.saveColor(activeColor) } label: { Image(systemName: "plus") }
+                    .buttonStyle(.plain).help("現在の色をカラーセットに追加").accessibilityLabel("現在の色をカラーセットに追加")
+                    .disabled(engine.colorSet.count >= 64)
+            }
+            ScrollView {
+                swatches(engine.colorSet, saved: true)
+            }.frame(maxHeight: 64)
+        }
+        .disabled(engine.isBusy || engine.strokeActive)
+        .onAppear { hex = activeColor.hex }
+        .onChange(of: activeColor) { _, value in if !hexFocused { hex = value.hex; invalidHex = false } }
+        .onChange(of: editingBackground) { _, _ in hex = activeColor.hex; invalidHex = false }
+        .onChange(of: hexFocused) { _, focused in if !focused { commitHex() } }
+    }
+    private func commitHex() {
+        guard let value = PaintColor(hex: hex) else { invalidHex = true; return }
+        selection.wrappedValue = value; hex = value.hex; invalidHex = false
+    }
+    private func colorButton(_ color: PaintColor, title: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Rectangle().fill(Color(color)).frame(width: 28, height: 28)
+                .overlay(Rectangle().stroke(selected ? Color.white : Color.gray, lineWidth: selected ? 2 : 1))
+        }.buttonStyle(.plain).accessibilityLabel("\(title) \(color.hex)")
+    }
+    private func swatches(_ colors: [PaintColor], saved: Bool) -> some View {
+        LazyVGrid(columns: Array(repeating: GridItem(.fixed(24), spacing: 6), count: 8), alignment: .leading, spacing: 6) {
+            ForEach(Array(colors.enumerated()), id: \.offset) { _, color in
+                Rectangle().fill(Color(color)).frame(width: 24, height: 24)
+                    .overlay(Rectangle().stroke(activeColor.hex == color.hex ? Color.white : Color.clear, lineWidth: 2))
+                    .contentShape(Rectangle())
+                    .onTapGesture { selection.wrappedValue = color }
+                    .onLongPressGesture { if saved { engine.removeSavedColor(color) } }
+                    .contextMenu { if saved { Button("カラーセットから削除", role: .destructive) { engine.removeSavedColor(color) } } }
+                    .accessibilityElement().accessibilityLabel("\(saved ? "カラーセット" : "最近使った色") \(color.hex)")
+                    .accessibilityAddTraits(activeColor.hex == color.hex ? [.isButton, .isSelected] : [.isButton])
+                    .accessibilityAction { selection.wrappedValue = color }
+                    .accessibilityAction(named: "削除") { if saved { engine.removeSavedColor(color) } }
+            }
+        }.frame(minHeight: 24, alignment: .topLeading)
+    }
+}
+
+private extension Color {
+    init(_ color: PaintColor) { self.init(red: color.red, green: color.green, blue: color.blue) }
+}
+
+struct HSVColorControl: View {
+    @Binding var color: PaintColor
+    @State private var hue = 0.0
+    @State private var saturation = 0.0
+    @State private var value = 0.0
+    private let diameter = 164.0
+    private let square = 96.0
+    var body: some View {
+        ZStack {
+            Circle().strokeBorder(AngularGradient(colors: (0...12).map {
+                Color(hue: Double($0) / 12, saturation: 1, brightness: 1)
+            }, center: .center), lineWidth: 18)
+                .frame(width: diameter, height: diameter)
+                .contentShape(Circle())
+                .gesture(DragGesture(minimumDistance: 0).onChanged { gesture in
+                    hue = (atan2(gesture.location.y - diameter/2, gesture.location.x - diameter/2) / (2 * .pi) + 1).truncatingRemainder(dividingBy: 1)
+                    update()
+                })
+                .accessibilityLabel("色相").accessibilityValue("\(Int(hue * 360))度")
+                .accessibilityAdjustableAction { direction in
+                    hue = (hue + (direction == .increment ? 1.0/360 : 359.0/360)).truncatingRemainder(dividingBy: 1); update()
+                }
+            Rectangle().fill(Color(hue: hue, saturation: 1, brightness: 1))
+                .overlay(LinearGradient(colors: [.white, .clear], startPoint: .leading, endPoint: .trailing))
+                .overlay(LinearGradient(colors: [.clear, .black], startPoint: .top, endPoint: .bottom))
+                .frame(width: square, height: square)
+                .overlay(alignment: .topLeading) {
+                    Circle().stroke(.black, lineWidth: 3).overlay(Circle().stroke(.white, lineWidth: 1.5))
+                        .frame(width: 9, height: 9).offset(x: saturation * square - 4.5, y: (1-value) * square - 4.5)
+                        .allowsHitTesting(false)
+                }
+                .gesture(DragGesture(minimumDistance: 0).onChanged { gesture in
+                    saturation = min(1, max(0, gesture.location.x / square))
+                    value = 1 - min(1, max(0, gesture.location.y / square)); update()
+                })
+                .accessibilityLabel("彩度と明度").accessibilityValue("彩度\(Int(saturation * 100))%、明度\(Int(value * 100))%")
+                .accessibilityAdjustableAction { direction in
+                    value = min(1, max(0, value + (direction == .increment ? 0.01 : -0.01))); update()
+                }
+                .accessibilityAction(named: "彩度を上げる") { saturation = min(1, saturation + 0.01); update() }
+                .accessibilityAction(named: "彩度を下げる") { saturation = max(0, saturation - 0.01); update() }
+            Circle().stroke(.white, lineWidth: 2).frame(width: 12, height: 12)
+                .offset(x: cos(hue * 2 * .pi) * (diameter/2 - 9), y: sin(hue * 2 * .pi) * (diameter/2 - 9))
+                .allowsHitTesting(false)
+        }
+        .onAppear { sync() }
+        .onChange(of: color) { _, newColor in
+            let current = PaintColor(hue: hue, saturation: saturation, value: value)
+            if abs(current.red-newColor.red) + abs(current.green-newColor.green) + abs(current.blue-newColor.blue) > 0.00001 { sync() }
+        }
+    }
+    private func update() { color = PaintColor(hue: hue, saturation: saturation, value: value) }
+    private func sync() {
+        let hsv = color.hsv
+        if hsv.saturation > 0 { hue = hsv.hue }
+        saturation = hsv.saturation; value = hsv.value
     }
 }
 

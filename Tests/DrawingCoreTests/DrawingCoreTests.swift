@@ -145,4 +145,17 @@ final class DrawingCoreTests: XCTestCase {
         try await writer.write(old, revision: 1, to: url)
         XCTAssertEqual(try DocumentSnapshot.decode(Data(contentsOf: url)), newest)
     }
+    func testHSVAndHexRoundTrips() throws {
+        for color in [PaintColor(1, 0, 0), .init(0, 1, 0), .init(0, 0, 1), .ink, .init(0, 0, 0), .init(1, 1, 1)] {
+            let hsv = color.hsv, restored = PaintColor(hue: color.hsv.hue, saturation: color.hsv.saturation, value: color.hsv.value)
+            XCTAssertEqual(restored.red, color.red, accuracy: 0.00001)
+            XCTAssertEqual(restored.green, color.green, accuracy: 0.00001)
+            XCTAssertEqual(restored.blue, color.blue, accuracy: 0.00001)
+            XCTAssertTrue((0...1).contains(hsv.hue))
+            XCTAssertEqual(try XCTUnwrap(PaintColor(hex: color.hex)).red, color.red, accuracy: 1.0/255)
+        }
+        XCTAssertEqual(PaintColor(hex: "  #fF8000 ")?.hex, "#FF8000")
+        for invalid in ["#xyzxyz", "#123", "##123456", "1234567", "１２３４５６"] { XCTAssertNil(PaintColor(hex: invalid)) }
+    }
+
 }

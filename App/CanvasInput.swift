@@ -48,6 +48,7 @@ final class CanvasPointer {
         if !cancelled, !moving, (engine.tool == .rectangle || engine.tool == .lasso), polygon.count >= 3 {
             engine.select(polygon: polygon)
         }
+        if start != nil, !cancelled, !moving, engine.tool == .eyedropper { engine.rememberColor() }
         start = nil; polygon = []; moving = false; lastViewPoint = nil; lastPressure = nil; onPath?([])
     }
     func undoIncludingStroke() { end(); engine.undo() }
@@ -379,7 +380,7 @@ final class MouseCanvas: MTKView, MTKViewDelegate {
         switch event.charactersIgnoringModifiers?.lowercased() {
         case "b": toolInput.select(.pen); case "p": toolInput.select(.pencil); case "e": toolInput.select(.eraser)
         case "g": toolInput.select(.fill); case "i": toolInput.select(.eyedropper); case "h": toolInput.select(.hand)
-        case "x": if !event.isARepeat { toolInput.toggleEraser() }
+        case "x": if !event.isARepeat { pointer.end(); engine.swapColors() }
         case "[": engine.brush.size = max(1, engine.brush.size - 2)
         case "]": engine.brush.size = min(512, engine.brush.size + 2)
         default: super.keyDown(with: event)
