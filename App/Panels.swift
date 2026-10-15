@@ -10,6 +10,7 @@ struct BrushPanel: View {
     @ObservedObject var engine: PaintEngine
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
+            if engine.tool.isBrush {
             Text("ブラシ").font(.headline)
             HStack {
                 ForEach([4, 12, 32, 80], id: \.self) { size in
@@ -41,10 +42,13 @@ struct BrushPanel: View {
             }.frame(height: 65).accessibilityLabel("ブラシの色とサイズの目安")
             Text("試し描きはキャンバス上で行い、元に戻す操作で取り消せます。")
                 .font(.caption2).foregroundStyle(.secondary)
+            }
             if engine.tool == .fill {
+                Text("塗りつぶし").font(.headline)
+                parameter("不透明度", value: $engine.brush.opacity, range: 0.01...1, percent: true)
                 parameter("塗りつぶしの許容差", value: Binding(get: { Double(engine.fillTolerance) },
                     set: { engine.fillTolerance = Int($0) }), range: 0...255)
-                Text("現在のレイヤーのつながった領域を塗ります。")
+                Text("表示中の全レイヤーを境界にして、選択レイヤーへ塗ります。")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }.disabled(engine.isBusy)

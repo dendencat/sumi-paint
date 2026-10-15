@@ -102,17 +102,23 @@ private struct EditorWorkspace: View {
                 header
                 Divider()
                 #if os(macOS)
+                quickBrush
+                Divider()
                 desktop
                 #else
                 if geometry.size.width >= 850 {
                     HStack(spacing: 0) {
                         ScrollView { ToolStrip(engine: engine, vertical: true) }.frame(width: 62).background(panelColor)
                         PaintCanvas(engine: engine).allowsHitTesting(!model.fileBusy)
-                        ScrollView {
-                            ColorPanel(engine: engine); Divider().padding(.vertical)
-                            BrushPanel(engine: engine); Divider().padding(.vertical)
+                        VStack(spacing: 0) {
+                            ScrollView {
+                                ColorPanel(engine: engine)
+                                Divider().padding(.vertical, 8)
+                                BrushPanel(engine: engine)
+                            }.frame(maxHeight: geometry.size.height * 0.48)
+                            Divider().padding(.vertical, 8)
                             LayerPanel(engine: engine)
-                        }.padding(14).frame(width: 250).background(panelColor)
+                        }.padding(8).frame(width: 260).background(panelColor)
                     }
                 } else {
                     PaintCanvas(engine: engine).allowsHitTesting(!model.fileBusy)
@@ -134,24 +140,56 @@ private struct EditorWorkspace: View {
     }
     private var desktop: some View {
         HStack(spacing: 0) {
-            if !engine.leftHanded { leftPanel }
+            HStack(spacing: 0) {
+                if engine.leftHanded {
+                    toolProperties
+                    Divider().frame(width: 1)
+                    toolRail
+                } else {
+                    toolRail
+                    Divider().frame(width: 1)
+                    toolProperties
+                }
+            }.background(panelColor)
+            Divider().frame(width: 1)
             PaintCanvas(engine: engine).allowsHitTesting(!model.fileBusy)
-            if engine.leftHanded { leftPanel }
-            ScrollView { LayerPanel(engine: engine).padding(14) }.frame(width: 240).background(panelColor)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            Divider().frame(width: 1)
+            VStack(spacing: 0) {
+                ColorPanel(engine: engine).padding(8).fixedSize(horizontal: false, vertical: true)
+                Divider().padding(.vertical, 8)
+                LayerPanel(engine: engine).padding(.horizontal, 8).padding(.bottom, 8)
+                    .frame(maxHeight: .infinity)
+            }.frame(width: 260).background(panelColor)
         }
     }
-    private var leftPanel: some View {
+    private var toolRail: some View {
+        ScrollView { ToolStrip(engine: engine, vertical: true) }.frame(width: 52)
+    }
+    private var toolProperties: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                Text("TOOLS").font(.caption).foregroundStyle(.secondary)
-                ToolStrip(engine: engine, vertical: false)
-                Divider(); ColorPanel(engine: engine); Divider(); BrushPanel(engine: engine)
-            }.padding(14)
-        }.frame(width: 220).background(panelColor)
+            VStack(alignment: .leading, spacing: 8) {
+                Text(engine.tool.title).font(.headline)
+                Divider().padding(.vertical, 8)
+                if engine.tool.isBrush || engine.tool == .fill {
+                    BrushPanel(engine: engine)
+                } else {
+                    Text(toolHint).font(.caption).foregroundStyle(.secondary)
+                }
+            }.padding(8)
+        }.frame(width: 220)
+    }
+    private var toolHint: String {
+        switch engine.tool {
+        case .eyedropper: return "キャンバス上をドラッグして色を選びます。"
+        case .rectangle, .lasso: return "キャンバス上をドラッグして範囲を選びます。選択範囲は作品メニューから変形・消去できます。"
+        case .hand: return "ドラッグでキャンバスを移動します。"
+        default: return ""
+        }
     }
     private var header: some View {
         HStack(spacing: 12) {
-            Image(systemName: "paintbrush.pointed.fill").foregroundStyle(.mint)
+            Image(systemName: "paintbrush.pointed.fill").foregroundStyle(.secondary)
             Text("Sumi Paint").font(.headline)
             Spacer(minLength: 4)
             Button { engine.undo() } label: { Image(systemName: "arrow.uturn.backward") }
@@ -174,7 +212,9 @@ private struct EditorWorkspace: View {
                 Button("全体を表示", systemImage: "arrow.up.left.and.arrow.down.right") { engine.viewport.fit(); engine.requestDisplay?() }
                 Button("左右反転表示", systemImage: "arrow.left.and.right.righttriangle.left.righttriangle.right") { engine.viewport.mirrored.toggle(); engine.requestDisplay?() }
                 Toggle("透明部分をチェック柄で表示", isOn: $engine.checkerboard)
+                #if os(macOS)
                 Toggle("左利き用の配置", isOn: $engine.leftHanded)
+                #endif
                 #if os(iOS)
                 Toggle("指で描く", isOn: $engine.fingerDrawing)
                 #else
@@ -197,9 +237,12 @@ private struct EditorWorkspace: View {
             Circle().fill(Color(red: engine.color.red, green: engine.color.green, blue: engine.color.blue))
                 .frame(width: 24, height: 24).onTapGesture { panel = .color }.accessibilityLabel("現在の色")
             Text("\(Int(engine.brush.size))px").font(.caption.monospacedDigit()).frame(width: 42)
-            Slider(value: $engine.brush.size, in: 1...200, step: 1).accessibilityLabel("ブラシサイズ")
+            Slider(value: $engine.brush.size, in: 1...512, step: 1).frame(maxWidth: 220).accessibilityLabel("ブラシサイズ")
             Text("\(Int(engine.brush.opacity * 100))%").font(.caption.monospacedDigit()).frame(width: 36)
             Slider(value: $engine.brush.opacity, in: 0.01...1).frame(maxWidth: 100).accessibilityLabel("不透明度")
+            #if os(macOS)
+            Spacer(minLength: 0)
+            #endif
         }.padding(.horizontal, 12).frame(height: 40).background(panelColor)
     }
     private func panelButton(_ title: String, icon: String, value: EditorPanel) -> some View {
@@ -239,8 +282,15 @@ struct ToolStrip: View {
             Button { engine.setTool(tool) } label: {
                 VStack(spacing: 4) {
                     Image(systemName: tool.icon).font(.system(size: 19))
+                    #if os(iOS)
                     Text(tool.title).font(.system(size: 9)).lineLimit(1)
-                }.frame(width: 46, height: 46)
+                    #endif
+                }
+                #if os(macOS)
+                .frame(width: 36, height: 36)
+                #else
+                .frame(width: 46, height: 46)
+                #endif
                     .foregroundStyle(engine.tool == tool ? Color.mint : Color.secondary)
                     .background(engine.tool == tool ? Color.mint.opacity(0.12) : Color.clear, in: RoundedRectangle(cornerRadius: 9))
             }.buttonStyle(.plain).help(tool.title).accessibilityLabel(tool.title)
