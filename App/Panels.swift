@@ -48,6 +48,8 @@ struct BrushPanel: View {
                 parameter("不透明度", value: $engine.brush.opacity, range: 0.01...1, percent: true)
                 parameter("塗りつぶしの許容差", value: Binding(get: { Double(engine.fillTolerance) },
                     set: { engine.fillTolerance = Int($0) }), range: 0...255)
+                Stepper("領域を広げる: \(engine.fillExpansion)px", value: $engine.fillExpansion, in: 0...8)
+                    .font(.caption)
                 Text("表示中の全レイヤーを境界にして、選択レイヤーへ塗ります。")
                     .font(.caption).foregroundStyle(.secondary)
             }

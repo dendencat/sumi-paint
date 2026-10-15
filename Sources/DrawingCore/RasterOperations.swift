@@ -28,33 +28,56 @@ public enum RasterOperations {
 
     /// Connected four-neighbour fill. Selection is both a boundary and an edit mask.
     public static func floodFill(pixels: inout [UInt8], width: Int, height: Int, x: Int, y: Int,
-                                 color: PaintColor, tolerance: Int, mask: [UInt8]?, alphaLocked: Bool) {
+                                 color: PaintColor, tolerance: Int, mask: [UInt8]?, alphaLocked: Bool, reference: [UInt8]? = nil, expansion: Int = 0) {
         guard width > 0, height > 0, pixels.count == width * height * 4,
               (0..<width).contains(x), (0..<height).contains(y),
-              mask == nil || mask?.count == width * height else { return }
+              mask == nil || mask?.count == width * height,
+              reference == nil || reference?.count == pixels.count else { return }
         let seed = y * width + x
         if let mask, mask[seed] == 0 { return }
-        let target = Array(pixels[seed * 4..<seed * 4 + 4])
+        let boundary = reference ?? pixels
+        let target = Array(boundary[seed * 4..<seed * 4 + 4])
         let replacement = color.premultipliedBytes
         let threshold = min(255, max(0, tolerance))
         var visited = [UInt8](repeating: 0, count: width * height)
+        var area = [UInt8](repeating: 0, count: width * height)
         var queue = [seed]; visited[seed] = 1
         var head = 0
         while head < queue.count {
             let index = queue[head]; head += 1
             if let mask, mask[index] == 0 { continue }
             let offset = index * 4
-            guard (0..<4).allSatisfy({ abs(Int(pixels[offset + $0]) - Int(target[$0])) <= threshold }) else { continue }
-            if alphaLocked {
-                let alpha = Double(pixels[offset + 3]) / 255
-                let values = PaintColor(color.red, color.green, color.blue, alpha).premultipliedBytes
-                for c in 0..<4 { pixels[offset + c] = values[c] }
-            } else { for c in 0..<4 { pixels[offset + c] = replacement[c] } }
+            guard (0..<4).allSatisfy({ abs(Int(boundary[offset + $0]) - Int(target[$0])) <= threshold }) else { continue }
+            area[index] = 1
             let px = index % width, py = index / width
             let neighbors = [px > 0 ? index - 1 : -1, px + 1 < width ? index + 1 : -1,
                              py > 0 ? index - width : -1, py + 1 < height ? index + width : -1]
             for n in neighbors where n >= 0 && visited[n] == 0 { visited[n] = 1; queue.append(n) }
         }
+        // Expand beneath antialiased line edges without crossing the selection.
+        for _ in 0..<min(8, max(0, expansion)) {
+            var grown = area
+            for index in area.indices where area[index] != 0 {
+                let px = index % width, py = index / width
+                let neighbors = [px > 0 ? index - 1 : -1, px + 1 < width ? index + 1 : -1,
+                                 py > 0 ? index - width : -1, py + 1 < height ? index + width : -1]
+                for n in neighbors where n >= 0 && (mask == nil || mask![n] != 0) { grown[n] = 1 }
+            }
+            area = grown
+        }
+        for index in area.indices where area[index] != 0 {
+            let offset = index * 4
+            if alphaLocked {
+                let alpha = Int(pixels[offset + 3]), inverse = 255 - Int(replacement[3])
+                for c in 0..<3 {
+                    pixels[offset + c] = UInt8(min(alpha, (Int(replacement[c]) * alpha + Int(pixels[offset + c]) * inverse + 127) / 255))
+                }
+            } else {
+                let inverse = 255 - Int(replacement[3])
+                for c in 0..<4 { pixels[offset + c] = UInt8(min(255, Int(replacement[c]) + (Int(pixels[offset + c]) * inverse + 127) / 255)) }
+            }
+        }
+
     }
 
     /// Destructive selected-pixel transform, nearest neighbour, with source-over compositing.

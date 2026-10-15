@@ -51,6 +51,21 @@ fragment float4 brushFragment(DabVertex in [[stage_in]], texture2d<float> mask [
     return float4(in.color.rgb * alpha, alpha);
 }
 
+// The stamp texture stores the strongest coverage within one stroke. Resolve
+// against the immutable original so overlapping dabs never build up opacity.
+kernel void resolveStroke(texture2d<float, access::read> original [[texture(0)]],
+                          texture2d<float, access::read> coverage [[texture(1)]],
+                          texture2d<float, access::write> output [[texture(2)]],
+                          constant uint2 &origin [[buffer(0)]], constant uint2 &mode [[buffer(1)]],
+                          uint2 gid [[thread_position_in_grid]]) {
+    uint2 point = origin + gid;
+    if (point.x >= output.get_width() || point.y >= output.get_height()) return;
+    float4 dst = original.read(point), src = coverage.read(point);
+    if (mode.x) output.write(dst * (1 - src.a), point);
+    else if (mode.y) output.write(float4(src.rgb * dst.a + dst.rgb * (1 - src.a), dst.a), point);
+    else output.write(src + dst * (1 - src.a), point);
+}
+
 kernel void clearRegion(texture2d<float, access::write> output [[texture(0)]],
                         constant uint2 &origin [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
     uint2 point = origin + gid;

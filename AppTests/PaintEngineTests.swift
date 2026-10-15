@@ -368,6 +368,38 @@ final class PaintEngineTests: XCTestCase {
         engine.beginStroke(.init(point: .init(32, 48), time: 2, pressure: 1))
         XCTAssertFalse(engine.strokeActive)
     }
+    func testBrushOpacityCapsOneStrokeButSeparateStrokesBuildUp() async throws {
+        let engine = try makeEngine(); engine.brush.opacity = 0.3
+        engine.beginStroke(.init(point: .init(8, 32), time: 0, pressure: 1))
+        for index in 1...12 {
+            engine.appendStroke(.init(point: .init(index.isMultiple(of: 2) ? 8 : 56, 32), time: Double(index), pressure: 1))
+        }
+        let preview = try engine.snapshot().layers[0].pixels
+        XCTAssertEqual(Double(preview[(32 * 64 + 32) * 4 + 3]), 76.5, accuracy: 1)
+        engine.endStroke()
+        let first = try engine.snapshot().layers[0].pixels
+        XCTAssertLessThanOrEqual(first.enumerated().filter { $0.offset % 4 == 3 }.map(\.element).max()!, 77)
+        stroke(engine, from: .init(8, 32), to: .init(56, 32))
+        XCTAssertEqual(Double(try engine.snapshot().layers[0].pixels[(32 * 64 + 32) * 4 + 3]), 130, accuracy: 2)
+        engine.undo(); XCTAssertEqual(try engine.snapshot().layers[0].pixels, first)
+        engine.setTool(.eraser); engine.brush.opacity = 0.3
+        stroke(engine, from: .init(8, 32), to: .init(56, 32))
+        XCTAssertEqual(Double(try engine.snapshot().layers[0].pixels[(32 * 64 + 32) * 4 + 3]), 54, accuracy: 2)
+    }
+    func testFillReferencesVisibleLayersAndRespectsOpacity() async throws {
+        let engine = try makeEngine()
+        stroke(engine, from: .init(32, 0), to: .init(32, 64))
+        engine.addLayer(); engine.moveLayer(-1)
+        engine.setTool(.fill); engine.brush.opacity = 0.3; engine.setColor(.init(1, 0, 0))
+        engine.fill(at: .init(8, 32))
+        while engine.isBusy { await Task.yield() }
+        let filled = try engine.snapshot().layers[0].pixels
+        XCTAssertEqual(Double(filled[(32 * 64 + 8) * 4 + 3]), 76.5, accuracy: 1)
+        XCTAssertEqual(filled[(32 * 64 + 56) * 4 + 3], 0)
+        XCTAssertEqual(engine.recentColors.first, .init(1, 0, 0))
+        engine.undo(); XCTAssertTrue(try engine.snapshot().layers[0].pixels.allSatisfy { $0 == 0 })
+        engine.redo(); XCTAssertEqual(try engine.snapshot().layers[0].pixels, filled)
+    }
     private func recoveryModel() throws -> (EditorModel, URL) {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let model = EditorModel(recoveryFolder: folder, idleDelay: 0.02, maximumInterval: 0.06)

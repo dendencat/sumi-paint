@@ -158,4 +158,16 @@ final class DrawingCoreTests: XCTestCase {
         for invalid in ["#xyzxyz", "#123", "##123456", "1234567", "１２３４５６"] { XCTAssertNil(PaintColor(hex: invalid)) }
     }
 
+    func testFillUsesSeparateReferenceAndExpansionStaysInsideSelection() {
+        var reference = [UInt8](repeating: 0, count: 5 * 3 * 4)
+        for y in 0..<3 { for c in 0..<4 { reference[(y * 5 + 2) * 4 + c] = 255 } }
+        var pixels = [UInt8](repeating: 0, count: reference.count)
+        let mask: [UInt8] = [255, 255, 255, 0, 0, 255, 255, 255, 0, 0, 255, 255, 255, 0, 0]
+        RasterOperations.floodFill(pixels: &pixels, width: 5, height: 3, x: 0, y: 1,
+            color: .init(1, 0, 0, 0.3), tolerance: 0, mask: mask, alphaLocked: false, reference: reference, expansion: 2)
+        XCTAssertEqual(pixels[(1 * 5 + 2) * 4 + 3], 77)
+        XCTAssertEqual(pixels[(1 * 5 + 3) * 4 + 3], 0)
+        XCTAssertEqual(pixels[(1 * 5 + 4) * 4 + 3], 0)
+    }
+
 }
