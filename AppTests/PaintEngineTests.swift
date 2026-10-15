@@ -286,6 +286,50 @@ final class PaintEngineTests: XCTestCase {
         XCTAssertEqual(try engine.snapshot().layers[0].pixels, navigating)
         engine.undo(); XCTAssertEqual(try engine.snapshot().layers[0].pixels, both)
     }
+    func testFocusLossCommitsActiveStrokeButEscapeCancelsIt() async throws {
+        let engine = try makeEngine()
+        engine.viewport.viewWidth = 64; engine.viewport.viewHeight = 64; engine.viewport.zoom = 1
+        let canvas = MouseCanvas(engine: engine, tabletSettings: tabletSettings())
+        canvas.pointer.begin(point: .init(32, 32), time: 0, pressure: 1)
+        let painted = try engine.snapshot().layers[0].pixels
+        _ = canvas.resignFirstResponder()
+        XCTAssertEqual(try engine.snapshot().layers[0].pixels, painted); XCTAssertTrue(engine.canUndo)
+        canvas.pointer.begin(point: .init(32, 48), time: 1, pressure: 1)
+        canvas.keyDown(with: try keyEvent("\u{1b}", code: 53))
+        XCTAssertEqual(try engine.snapshot().layers[0].pixels, painted)
+        engine.undo(); XCTAssertTrue(try engine.snapshot().layers[0].pixels.allSatisfy { $0 == 0 })
+    }
+    func testUndoGestureDiscardsProvisionalDotAndUndoesPreviousStroke() async throws {
+        let engine = try makeEngine()
+        engine.viewport.viewWidth = 64; engine.viewport.viewHeight = 64; engine.viewport.zoom = 1
+        stroke(engine, from: .init(8, 16), to: .init(56, 16))
+        let first = try engine.snapshot().layers[0].pixels
+        let pointer = CanvasPointer(engine: engine)
+        pointer.begin(point: .init(32, 48), time: 2, pressure: 1); pointer.undoGesture()
+        XCTAssertTrue(try engine.snapshot().layers[0].pixels.allSatisfy { $0 == 0 })
+        engine.redo(); XCTAssertEqual(try engine.snapshot().layers[0].pixels, first)
+    }
+    func testClearWithoutSelectionIsSafeAndEmptySelectionNormalizes() async throws {
+        let engine = try makeEngine()
+        stroke(engine, from: .init(8, 32), to: .init(56, 32))
+        let before = try engine.snapshot().layers[0].pixels, revision = engine.revision
+        engine.clearSelectedPixels()
+        XCTAssertFalse(engine.isBusy); XCTAssertEqual(engine.revision, revision)
+        XCTAssertEqual(try engine.snapshot().layers[0].pixels, before)
+        engine.select(polygon: [.init(-30, -30), .init(-20, -30), .init(-20, -20)])
+        XCTAssertFalse(engine.hasSelection)
+        engine.setTool(.fill); engine.fill(at: .init(0, 0))
+        while engine.isBusy { await Task.yield() }
+        XCTAssertNotEqual(try engine.snapshot().layers[0].pixels, before)
+    }
+    func testToolSwitchRestoresIndividualBrushSettings() async throws {
+        let engine = try makeEngine()
+        engine.brush.size = 27; engine.brush.hardness = 0.22; let pen = engine.brush
+        engine.setTool(.eyedropper); engine.setTool(.pen); XCTAssertEqual(engine.brush, pen)
+        engine.setTool(.eraser); engine.brush.size = 49; let eraser = engine.brush
+        engine.setTool(.pen); XCTAssertEqual(engine.brush, pen)
+        engine.setTool(.eraser); XCTAssertEqual(engine.brush, eraser)
+    }
     func testFailedUndoAndRedoKeepTheirHistoryUntilRetry() async throws {
         let engine = try makeEngine()
         stroke(engine, from: .init(10, 32), to: .init(54, 32))

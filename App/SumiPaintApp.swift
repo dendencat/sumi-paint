@@ -36,7 +36,7 @@ struct PaintCommands: Commands {
             Button("左右反転表示") { editor?.engine?.viewport.mirrored.toggle(); editor?.engine?.requestDisplay?() }.disabled(busy)
             Button("すべて選択") { editor?.engine?.selectAll() }.keyboardShortcut("a").disabled(busy)
             Button("選択を解除") { editor?.engine?.clearSelection() }.keyboardShortcut("d").disabled(busy)
-            Button("選択した画素を消去") { editor?.engine?.clearSelectedPixels() }.disabled(busy)
+            Button("選択した画素を消去") { editor?.engine?.clearSelectedPixels() }.disabled(busy || editor?.engine?.hasSelection != true)
             Button("画像を読み込む…") { editor?.requestImport(image: true) }.disabled(busy)
         }
     }

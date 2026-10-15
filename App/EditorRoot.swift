@@ -224,7 +224,7 @@ private struct EditorWorkspace: View {
                 Button("すべて選択") { engine.selectAll() }
                 Button("選択を解除") { engine.clearSelection() }.disabled(!engine.hasSelection)
                 Button("選択範囲を変形") { panel = .transform }.disabled(!engine.hasSelection)
-                Button("選択した画素を消去", role: .destructive) { engine.clearSelectedPixels() }
+                Button("選択した画素を消去", role: .destructive) { engine.clearSelectedPixels() }.disabled(!engine.hasSelection)
             } label: { Image(systemName: "ellipsis.circle").font(.title3) }
                 .disabled(engine.isBusy || engine.strokeActive || model.fileBusy)
                 .accessibilityLabel("作品とキャンバスのメニュー")

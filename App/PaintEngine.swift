@@ -81,6 +81,7 @@ final class PaintEngine: ObservableObject {
     @Published var selectedLayerID: UUID?
     @Published var tool: EditorTool = .pen
     @Published var brush = BrushSettings()
+    private var toolBrushes: [EditorTool: BrushSettings] = [:]
     private(set) var rememberedDrawingTool: EditorTool = .pen
     private(set) var rememberedDrawingBrush = BrushSettings()
     private let colorDefaults: UserDefaults
@@ -319,6 +320,7 @@ final class PaintEngine: ObservableObject {
         selectedLayerID = snapshot.selectedLayerID; documentID = snapshot.id
         brush = snapshot.brush; color = snapshot.color
         tool = brush.kind == .eraser ? .eraser : (brush.kind == .pencil ? .pencil : .pen)
+        toolBrushes = [tool: brush]
         rememberedDrawingTool = tool == .pencil ? .pencil : .pen
         rememberedDrawingBrush = brush
         rememberedDrawingBrush.kind = rememberedDrawingTool == .pencil ? .pencil : .pen
@@ -327,13 +329,16 @@ final class PaintEngine: ObservableObject {
 
     func setTool(_ value: EditorTool) {
         guard !strokeActive, tool != value else { return }
+        if tool.isBrush { toolBrushes[tool] = brush }
         if tool == .pen || tool == .pencil {
             rememberedDrawingTool = tool; rememberedDrawingBrush = brush
         }
         tool = value
         if value.isBrush {
-            brush.kind = value == .eraser ? .eraser : (value == .pencil ? .pencil : .pen)
-            brush.hardness = value == .pencil ? 0.6 : 0.85
+            var initial = BrushSettings()
+            initial.kind = value == .eraser ? .eraser : (value == .pencil ? .pencil : .pen)
+            initial.hardness = value == .pencil ? 0.6 : 0.85
+            brush = toolBrushes[value] ?? initial
         }
     }
     func setColor(_ value: PaintColor) {
@@ -711,8 +716,9 @@ final class PaintEngine: ObservableObject {
 
     private func setSelectionMask(_ mask: [UInt8]?) {
         guard waitForGPU() else { return }
-        selectionMask = mask; hasSelection = mask?.contains(where: { $0 != 0 }) == true
-        let values = mask ?? [UInt8](repeating: 0, count: width * height)
+        let normalized = mask?.contains(where: { $0 != 0 }) == true ? mask : nil
+        selectionMask = normalized; hasSelection = normalized != nil
+        let values = normalized ?? [UInt8](repeating: 0, count: width * height)
         values.withUnsafeBytes { selectionTexture.replace(region: fullRegion, mipmapLevel: 0, withBytes: $0.baseAddress!, bytesPerRow: width) }
         requestDisplay?()
     }
@@ -778,10 +784,10 @@ final class PaintEngine: ObservableObject {
         }
     }
     func clearSelectedPixels() {
-        guard selectedLayer?.properties.alphaLocked != true else { return }
+        guard hasSelection, selectedLayer?.properties.alphaLocked != true else { return }
         rasterEdit { pixels, mask, _, _ in
             var result = pixels
-            for index in stride(from: 0, to: pixels.count, by: 4) where mask == nil || mask![index / 4] != 0 {
+            for index in stride(from: 0, to: pixels.count, by: 4) where mask?[index / 4] != 0 {
                 for c in 0..<4 { result[index + c] = 0 }
             }
             return (result, mask)

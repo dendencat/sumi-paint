@@ -106,8 +106,8 @@ final class MacCanvasToolState {
             select(.eraser)
         }
     }
-    func reset() {
-        pointer.end(cancelled: true)
+    func reset(cancelled: Bool = false) {
+        pointer.end(cancelled: cancelled)
         synchronizeSelection()
         let base = modes.baseMode
         modes.reset(to: base); apply(base)
