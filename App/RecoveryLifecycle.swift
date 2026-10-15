@@ -1,5 +1,15 @@
 import SwiftUI
 
+@MainActor
+final class RecoverySessions {
+    static let shared = RecoverySessions()
+    private let models = NSHashTable<EditorModel>.weakObjects()
+    func add(_ model: EditorModel) { models.add(model) }
+    func remove(_ model: EditorModel) { models.remove(model) }
+    var active: [EditorModel] { models.allObjects }
+}
+
+
 #if os(iOS)
 import UIKit
 
@@ -20,14 +30,6 @@ final class BackgroundSaveBudget {
 import AppKit
 
 @MainActor
-final class RecoverySessions {
-    static let shared = RecoverySessions()
-    private let models = NSHashTable<EditorModel>.weakObjects()
-    func add(_ model: EditorModel) { models.add(model) }
-    var active: [EditorModel] { models.allObjects }
-}
-
-@MainActor
 final class PaintApplicationDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let editors = RecoverySessions.shared.active
@@ -44,6 +46,7 @@ final class PaintApplicationDelegate: NSObject, NSApplicationDelegate {
                 alert.addButton(withTitle: "保存せず終了")
                 succeeded = alert.runModal() == .alertSecondButtonReturn
             }
+            if succeeded { editors.forEach { $0.acknowledgeCleanExit() } }
             sender.reply(toApplicationShouldTerminate: succeeded)
         }
         return .terminateLater

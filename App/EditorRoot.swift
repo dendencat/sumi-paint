@@ -77,10 +77,16 @@ struct EditorRoot: View {
             }
         }
         .alert("前回の作業が見つかりました", isPresented: Binding(
-            get: { model.recoveryURL != nil }, set: { if !$0 { model.recoveryURL = nil } }), presenting: model.recoveryURL) { url in
+            get: { model.recoveryURL != nil }, set: { if !$0 {
+                model.dismissRecoveryPrompt()
+            } }), presenting: model.recoveryURL) { url in
                 Button("復元する") { model.restoreRecovery(url) }
-                Button("復旧ファイルを選ぶ") { model.recoveryURL = nil; model.showRecoveryManager = true }
-                Button("新しく始める", role: .cancel) { model.recoveryURL = nil }
+                Button("復旧ファイルを選ぶ") {
+                    model.dismissRecoveryPrompt(); model.showRecoveryManager = true
+                }
+                Button("新しく始める", role: .cancel) {
+                    model.dismissRecoveryPrompt()
+                }
             } message: { _ in Text("自動保存した作品を開けます。復旧ファイルはアプリの保存領域に残ります。") }
         .onChange(of: scenePhase) { _, phase in
             if phase != .active {

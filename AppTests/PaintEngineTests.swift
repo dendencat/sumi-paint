@@ -8,7 +8,10 @@ import ImageIO
 final class PaintEngineTests: XCTestCase {
     private func makeEngine() throws -> PaintEngine {
         guard MTLCreateSystemDefaultDevice() != nil else { throw PaintDocumentError.invalid("The required Metal test device is unavailable") }
-        let engine = try PaintEngine()
+        let suite = "SumiPaintTests.Engine.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        let engine = try PaintEngine(defaults: defaults)
         try engine.newDocument(width: 64, height: 64)
         engine.brush.stabilization = 0; engine.brush.size = 12; engine.brush.hardness = 0.99
         return engine
@@ -402,7 +405,10 @@ final class PaintEngineTests: XCTestCase {
     }
     private func recoveryModel() throws -> (EditorModel, URL) {
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        let model = EditorModel(recoveryFolder: folder, idleDelay: 0.02, maximumInterval: 0.06)
+        let suite = "SumiPaintTests.RecoveryModel.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+        let model = EditorModel(recoveryFolder: folder, idleDelay: 0.02, maximumInterval: 0.06, defaults: defaults)
         _ = try XCTUnwrap(model.engine)
         addTeardownBlock { @MainActor in
             model.cancelRecoveryForTesting()
@@ -441,4 +447,87 @@ final class PaintEngineTests: XCTestCase {
         let failed = await model.saveRecovery(); XCTAssertFalse(failed)
         XCTAssertEqual(try Data(contentsOf: url), good)
     }
+    func testCleanExitKeepsUnsavedArtworkWithoutRepeatingRecoveryAlert() async throws {
+        let suite = "SumiPaintTests.Recovery.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let model = EditorModel(recoveryFolder: folder, idleDelay: 100, defaults: defaults)
+        let engine = try XCTUnwrap(model.engine); try engine.newDocument(width: 64, height: 64)
+        stroke(engine, from: .init(8, 32), to: .init(56, 32))
+        let saved = await model.saveRecovery(); XCTAssertTrue(saved)
+        model.cancelRecoveryForTesting(); model.acknowledgeCleanExit()
+        XCTAssertFalse((defaults.dictionary(forKey: "recovery.acknowledged") ?? [:]).isEmpty)
+        let url = try XCTUnwrap(RecoveryCatalog.entries(in: folder).first?.url)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+        let next = EditorModel(recoveryFolder: folder, idleDelay: 100, defaults: defaults)
+        XCTAssertNil(next.recoveryURL)
+        // A newer checkpoint after the acknowledgement represents interrupted work.
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(2)], ofItemAtPath: url.path)
+        let interrupted = EditorModel(recoveryFolder: folder, idleDelay: 100, defaults: defaults)
+        XCTAssertEqual(interrupted.recoveryURL, url)
+        interrupted.restoreRecovery(url)
+        while interrupted.fileBusy { await Task.yield() }
+        let restored = try XCTUnwrap(interrupted.engine)
+        XCTAssertEqual(try restored.snapshot().layers[0].pixels, try engine.snapshot().layers[0].pixels)
+        stroke(restored, from: .init(8, 48), to: .init(56, 48))
+        let resaved = await interrupted.saveRecovery(); XCTAssertTrue(resaved)
+        interrupted.cancelRecoveryForTesting()
+        XCTAssertEqual(try RecoveryCatalog.entries(in: folder).map(\.url), [url], "Restoring must reuse the checkpoint")
+    }
+    func testSuccessfulDocumentExportRemovesOnlyMatchingRecovery() async throws {
+        let (model, folder) = try recoveryModel(), engine = try XCTUnwrap(model.engine)
+        try engine.newDocument(width: 64, height: 64)
+        stroke(engine, from: .init(8, 32), to: .init(56, 32))
+        let saved = await model.saveRecovery(); XCTAssertTrue(saved)
+        XCTAssertEqual(try RecoveryCatalog.entries(in: folder).count, 1)
+        model.prepareExport(png: false)
+        while model.fileBusy { await Task.yield() }
+        let destination = folder.appendingPathComponent("exported.document")
+        try XCTUnwrap(model.exportFile).data.write(to: destination)
+        model.handleExport(.success(destination))
+        for _ in 0..<100 {
+            if try RecoveryCatalog.entries(in: folder).isEmpty { break }
+            await Task.yield()
+        }
+        XCTAssertTrue(try RecoveryCatalog.entries(in: folder).isEmpty)
+        let noMoreRecovery = await model.saveRecovery(); XCTAssertTrue(noMoreRecovery)
+        XCTAssertTrue(try RecoveryCatalog.entries(in: folder).isEmpty)
+        stroke(engine, from: .init(8, 48), to: .init(56, 48))
+        let changed = await model.saveRecovery(); XCTAssertTrue(changed)
+        model.prepareExport(png: false)
+        while model.fileBusy { await Task.yield() }
+        stroke(engine, from: .init(8, 16), to: .init(56, 16))
+        let newer = await model.saveRecovery(); XCTAssertTrue(newer)
+        model.handleExport(.success(destination))
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertEqual(try RecoveryCatalog.entries(in: folder).count, 1, "Export of an older revision must preserve newer edits")
+        model.prepareExport(png: true)
+        while model.fileBusy { await Task.yield() }
+        model.handleExport(.success(destination))
+        await Task.yield()
+        XCTAssertEqual(try RecoveryCatalog.entries(in: folder).count, 1, "PNG does not preserve an editable document")
+    }
+
+    func testOpeningRecoveryInAnotherWindowDoesNotOverwriteActiveCheckpoint() async throws {
+        let (model, folder) = try recoveryModel(), engine = try XCTUnwrap(model.engine)
+        try engine.newDocument(width: 64, height: 64)
+        stroke(engine, from: .init(8, 16), to: .init(56, 16))
+        let saved = await model.saveRecovery(); XCTAssertTrue(saved)
+        let url = try XCTUnwrap(RecoveryCatalog.entries(in: folder).first?.url)
+        let original = try Data(contentsOf: url)
+        let suite = "SumiPaintTests.SecondWindow.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let second = EditorModel(recoveryFolder: folder, idleDelay: 100, defaults: defaults)
+        second.restoreRecovery(url)
+        while second.fileBusy { await Task.yield() }
+        stroke(try XCTUnwrap(second.engine), from: .init(8, 48), to: .init(56, 48))
+        let savedSecond = await second.saveRecovery(); XCTAssertTrue(savedSecond)
+        second.cancelRecoveryForTesting()
+        XCTAssertEqual(try RecoveryCatalog.entries(in: folder).count, 2)
+        XCTAssertEqual(try Data(contentsOf: url), original)
+    }
+
 }

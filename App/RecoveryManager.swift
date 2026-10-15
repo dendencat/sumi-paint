@@ -5,6 +5,7 @@ struct RecoveryManager: View {
     @State private var pendingDeletion: RecoveryEntry?
     var body: some View {
         NavigationStack {
+            VStack(spacing: 8) {
             Group {
                 if model.recoveryEntries.isEmpty {
                     ContentUnavailableView("復旧ファイルはありません", systemImage: "clock.arrow.circlepath")
@@ -28,6 +29,9 @@ struct RecoveryManager: View {
                         }.padding(.vertical, 4)
                     }
                 }
+            }
+            Text("編集中の作品を除き、最新5件・7日以内・合計256MBまで保持します。未保存の作品はここから開けます。")
+                .font(.caption).foregroundStyle(.secondary).padding(8)
             }
             .navigationTitle("復旧ファイル")
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("閉じる") { model.showRecoveryManager = false } } }

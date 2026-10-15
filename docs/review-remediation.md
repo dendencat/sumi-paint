@@ -10,10 +10,10 @@
 | --- | --- | --- |
 | SP-SEC-001: 作品デコード前の参照増幅によるメモリ・CPU消費 | 共通の `DocumentSnapshot.decode` で、モデルを構築する前にProperty Listの構造とデータ量を検証。実読込バイト数も制限 | Darwinの隔離・メモリ制限下の測定は [#1](https://github.com/dendencat/sumi-paint/issues/1) |
 | R1: 連続編集で自動保存が先送りされる | 変更ごとのタイマー再作成を廃止。最後の変更から2秒、最初の未保存変更から最大10秒を目安に開始。描画途中の画素も保存。書込みは単一タスクにまとめる | CPU処理中・書込み中は実時間が伸びる。ウィンドウ閉鎖、OSの期限、容量不足は [#3](https://github.com/dendencat/sumi-paint/issues/3) |
-| R2: 表示操作で描画中の線が失われ、Undoが前の線まで消す | UIKitのジェスチャー開始・タッチ中断では描画を確定。2本指Undoは進行中の線を履歴に入れてから1回戻す | 実際のジェスチャー認識順と入力機器は [#2](https://github.com/dendencat/sumi-paint/issues/2) |
+| R2: 表示操作で描画中の線が失われ、Undoが前の線まで消す | 2026-10-15更新: UIKitのジェスチャー開始・タッチ中断では仮の描画を破棄。2本指Undoは仮の点を破棄して前の操作を1回戻す。Macのフォーカス喪失は一筆を確定し、Escapeのみ取り消す | 実際のジェスチャー認識順と入力機器は [#2](https://github.com/dendencat/sumi-paint/issues/2) |
 | R3: 復元失敗でもUndo/Redo履歴を消費する | 画素復元が成功した場合だけ履歴を移動。メモリ確保失敗時は履歴・変更番号を保持。キャンセルの復元失敗では元画素を保持し、再試行を用意 | GPU自体が失敗した場合は再起動が必要。部分実行後の自動再開は [#3](https://github.com/dendencat/sumi-paint/issues/3) |
 | R4: GPU実行失敗でも保存・出力を成功扱いにする | 実際のコマンドの完了状態とエラーを検査。失敗を保持し、スナップショット・PNG出力・編集を拒否。最後の正常な復旧ファイルを上書きしない | 実機のGPU障害・再起動復旧は [#3](https://github.com/dendencat/sumi-paint/issues/3) |
-| R5: 古い復旧版を選べず、空キャンバスが最新候補になる | 全候補を日時・容量付きで一覧化し、選択・手動削除を追加。未編集の空キャンバスは保存しない。削除済みの現在の復旧版は次回保存で再作成可能 | 自動保持数・総容量・未保存作品の保護方針は [#3](https://github.com/dendencat/sumi-paint/issues/3) |
+| R5: 古い復旧版を選べず、空キャンバスが最新候補になる | 全候補を日時・容量付きで一覧化し、選択・手動削除を追加。未編集の空キャンバスは保存しない。削除済みの現在の復旧版は次回保存で再作成可能 | 2026-10-15に保持数・総容量・未保存作品保護を実装（[今回の対応](ux-review.md)）。終了境界の実機確認は [#3](https://github.com/dendencat/sumi-paint/issues/3) |
 | Mac配布のHardened Runtimeが無効 | Release構成とCIのアドホック署名で有効化。App Sandboxを維持 | Developer ID・公証はApple登録後、[#4](https://github.com/dendencat/sumi-paint/issues/4) |
 | MetalのないCIでも統合テストが成功扱いになる | 必須のMetalテストデバイスがなければ失敗に変更 | 実機テストを置き換えるものではない |
 

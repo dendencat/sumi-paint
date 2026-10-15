@@ -41,4 +41,23 @@ final class RecoveryTests: XCTestCase {
         XCTAssertThrowsError(try RecoveryCatalog.remove(forged, from: folder))
         XCTAssertTrue(FileManager.default.fileExists(atPath: target.path))
     }
+    func testRetentionBoundsAgeCountBytesAndProtectsActiveFiles() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let now = Date()
+        var urls: [URL] = []
+        for index in 0..<7 {
+            let url = folder.appendingPathComponent("\(index).sumipaint"); urls.append(url)
+            try Data(repeating: 0, count: 10).write(to: url)
+            try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(-Double(index) * 86400)], ofItemAtPath: url.path)
+        }
+        try RecoveryCatalog.prune(in: folder, maximumEntries: 3, maximumAge: 3 * 86400,
+            maximumBytes: 30, now: now, protected: [urls[6]])
+        XCTAssertEqual(Set(try RecoveryCatalog.entries(in: folder).map { $0.url.standardizedFileURL }), Set([urls[0], urls[1], urls[6]].map(\.standardizedFileURL)))
+        try RecoveryCatalog.prune(in: folder, maximumEntries: 5, maximumAge: 86400,
+            maximumBytes: 10, now: now)
+        XCTAssertEqual(try RecoveryCatalog.entries(in: folder).map { $0.url.standardizedFileURL }, [urls[0].standardizedFileURL])
+    }
+
 }
