@@ -19,18 +19,18 @@ public enum RecoveryCatalog {
                 return RecoveryEntry(url: url, modified: values.contentModificationDate ?? .distantPast, bytes: values.fileSize ?? 0)
             }.sorted { $0.modified > $1.modified }
     }
-    /// Apply retention only to acknowledged versions. Unreviewed and active
-    /// checkpoints survive even when they exceed the age, count or byte limits.
+    /// Apply retention only to versions known to have an editable copy saved
+    /// elsewhere. Notification acknowledgements never grant deletion permission.
     public static func prune(in folder: URL, maximumEntries: Int = 5,
                              maximumAge: TimeInterval = 7 * 24 * 60 * 60,
                              maximumBytes: Int = 256 * 1024 * 1024,
                              now: Date = .now, protected: Set<URL> = [],
-                             acknowledged: [String: Double] = [:]) throws {
+                             savedVersions: [String: Double] = [:]) throws {
         let candidates = try entries(in: folder)
         var protectedPaths = Set(protected.map { $0.standardizedFileURL.path })
         for entry in candidates {
             let path = entry.url.standardizedFileURL.path
-            if acknowledged[path].map({ $0 >= entry.modified.timeIntervalSince1970 }) != true {
+            if savedVersions[path].map({ $0 >= entry.modified.timeIntervalSince1970 }) != true {
                 protectedPaths.insert(path)
             }
         }

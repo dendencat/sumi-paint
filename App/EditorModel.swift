@@ -138,7 +138,9 @@ final class EditorModel: ObservableObject {
     private func pruneRecoveries() {
         var protected = protectedRecoveryURLs
         for model in RecoverySessions.shared.active { protected.formUnion(model.protectedRecoveryURLs) }
-        do { try RecoveryCatalog.prune(in: recoveryFolder, protected: protected, acknowledged: acknowledgedRecoveries) }
+        // All remaining checkpoints may be the only editable copy. Read/quit
+        // acknowledgements suppress alerts only; export removes its exact version.
+        do { try RecoveryCatalog.prune(in: recoveryFolder, protected: protected) }
         catch { engine?.errorMessage = "古い復旧ファイルを整理できません: \(error.localizedDescription)" }
     }
     func acknowledgeRecovery(_ url: URL) {
@@ -149,7 +151,7 @@ final class EditorModel: ObservableObject {
         defaults.set(acknowledgedRecoveries, forKey: "recovery.acknowledged")
     }
     func dismissRecoveryPrompt() {
-        for entry in recoveryEntries { acknowledgeRecovery(entry.url) }
+        if let recoveryURL { acknowledgeRecovery(recoveryURL) }
         recoveryURL = nil
     }
     /// Unsaved artwork must survive a normal quit. Acknowledge these checkpoints

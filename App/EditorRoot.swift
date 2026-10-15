@@ -50,18 +50,24 @@ struct EditorRoot: View {
         .sheet(item: $panel) { value in
             if let engine = model.engine {
                 NavigationStack {
-                    ScrollView {
-                        Group {
-                            switch value {
-                            case .brush: BrushPanel(engine: engine)
-                            case .color: ColorPanel(engine: engine)
-                            case .layers: LayerPanel(engine: engine)
-                            case .transform: TransformPanel(engine: engine, close: { panel = nil })
-                            #if os(macOS)
-                            case .tablet: MacTabletPanel()
-                            #endif
+                    Group {
+                        if value == .layers {
+                            LayerPanel(engine: engine).padding(20)
+                        } else {
+                            ScrollView {
+                                Group {
+                                    switch value {
+                                    case .brush: BrushPanel(engine: engine)
+                                    case .color: ColorPanel(engine: engine)
+                                    case .layers: EmptyView()
+                                    case .transform: TransformPanel(engine: engine, close: { panel = nil })
+                                    #if os(macOS)
+                                    case .tablet: MacTabletPanel()
+                                    #endif
+                                    }
+                                }.padding(20)
                             }
-                        }.padding(20)
+                        }
                     }
                     .navigationTitle(value.title)
                     .toolbar { ToolbarItem(placement: .confirmationAction) { Button("閉じる") { panel = nil } } }

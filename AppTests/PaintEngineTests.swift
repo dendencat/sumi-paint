@@ -420,6 +420,27 @@ final class PaintEngineTests: XCTestCase {
         engine.setTool(.eraser); XCTAssertEqual(engine.brush.opacity, 0.1)
     }
 
+    func testSavingFromFillPreservesDrawingBrushInsteadOfFillControls() async throws {
+        let engine = try makeEngine()
+        for drawingTool in [EditorTool.pen, .pencil] {
+            engine.setTool(drawingTool)
+            engine.brush.opacity = 0.23; engine.brush.size = 37; engine.brush.hardness = 0.42
+            let drawingBrush = engine.brush
+            engine.setTool(.eraser); engine.brush.opacity = 0.1
+            engine.setTool(.fill); engine.brush.opacity = 0.7
+            for tool in [EditorTool.fill, .eyedropper, .hand] {
+                engine.setTool(tool)
+                let snapshot = try DocumentSnapshot.decode(engine.snapshot().encoded())
+                XCTAssertEqual(snapshot.brush, drawingBrush)
+                let restored = try makeEngine()
+                try restored.load(snapshot)
+                XCTAssertEqual(restored.tool, drawingTool)
+                XCTAssertEqual(restored.brush, drawingBrush)
+            }
+            engine.setTool(.fill); XCTAssertEqual(engine.brush.opacity, 0.7)
+        }
+    }
+
     func testFingerNavigationPreservesPencilStrokeAndCancelsFingerInk() async throws {
         let engine = try makeEngine(), pointer = CanvasPointer(engine: engine)
         engine.viewport.viewWidth = 64; engine.viewport.viewHeight = 64; engine.viewport.zoom = 1
@@ -555,9 +576,12 @@ final class PaintEngineTests: XCTestCase {
         let engine = try XCTUnwrap(model.engine); try engine.newDocument(width: 64, height: 64)
         stroke(engine, from: .init(8, 32), to: .init(56, 32))
         let saved = await model.saveRecovery(); XCTAssertTrue(saved)
+        let url = try XCTUnwrap(RecoveryCatalog.entries(in: folder).first?.url)
+        // Quit an old unsaved version, then launch past every retention limit.
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-8 * 86400)], ofItemAtPath: url.path)
+        model.refreshRecoveryEntries()
         model.cancelRecoveryForTesting(); model.acknowledgeCleanExit()
         XCTAssertFalse((defaults.dictionary(forKey: "recovery.acknowledged") ?? [:]).isEmpty)
-        let url = try XCTUnwrap(RecoveryCatalog.entries(in: folder).first?.url)
         XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
         let next = EditorModel(recoveryFolder: folder, idleDelay: 100, defaults: defaults)
         XCTAssertNil(next.recoveryURL)
@@ -573,6 +597,52 @@ final class PaintEngineTests: XCTestCase {
         let resaved = await interrupted.saveRecovery(); XCTAssertTrue(resaved)
         interrupted.cancelRecoveryForTesting()
         XCTAssertEqual(try RecoveryCatalog.entries(in: folder).map(\.url), [url], "Restoring must reuse the checkpoint")
+    }
+
+    func testPromptActionsAndLegacyAcknowledgementsNeverDeleteUnsavedVersions() async throws {
+        for action in ["dismiss", "choose", "restore"] {
+            let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            let suite = "SumiPaintTests.Prompt.\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: folder) }
+            let snapshot = try makeEngine().snapshot(), writer = RecoveryWriter()
+            for index in 0..<7 {
+                let url = folder.appendingPathComponent("old-\(index).sumipaint")
+                try await writer.write(snapshot, revision: 1, to: url)
+                try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-8 * 86400 - Double(index))], ofItemAtPath: url.path)
+            }
+            let originals = try RecoveryCatalog.entries(in: folder)
+            // Existing installations may have marked every version as read.
+            defaults.set(Dictionary(uniqueKeysWithValues: originals.map {
+                ($0.url.standardizedFileURL.path, $0.modified.timeIntervalSince1970)
+            }), forKey: "recovery.acknowledged")
+            let legacy = EditorModel(recoveryFolder: folder, idleDelay: 100, defaults: defaults)
+            XCTAssertNil(legacy.recoveryURL)
+            XCTAssertEqual(legacy.recoveryEntries.count, 7)
+            legacy.acknowledgeCleanExit()
+            defaults.removeObject(forKey: "recovery.acknowledged")
+            let model = EditorModel(recoveryFolder: folder, idleDelay: 100, defaults: defaults)
+            defer { model.cancelRecoveryForTesting(); model.acknowledgeCleanExit() }
+            let shown = try XCTUnwrap(model.recoveryURL)
+            if action == "restore" {
+                model.restoreRecovery(shown)
+                while model.fileBusy { await Task.yield() }
+            } else {
+                model.dismissRecoveryPrompt()
+                if action == "choose" { model.showRecoveryManager = true }
+            }
+            let read = try XCTUnwrap(defaults.dictionary(forKey: "recovery.acknowledged"))
+            XCTAssertEqual(Set(read.keys), [shown.standardizedFileURL.path], "Only the displayed version was acknowledged")
+            let engine = try XCTUnwrap(model.engine)
+            stroke(engine, from: .init(8, 32), to: .init(56, 32))
+            let saved = await model.saveRecovery(); XCTAssertTrue(saved)
+            for entry in originals {
+                XCTAssertTrue(FileManager.default.fileExists(atPath: entry.url.path))
+                if action != "restore" || entry.url != shown {
+                    XCTAssertEqual(try DocumentSnapshot.decode(Data(contentsOf: entry.url)), snapshot)
+                }
+            }
+        }
     }
     func testSuccessfulDocumentExportRemovesOnlyMatchingRecovery() async throws {
         let (model, folder) = try recoveryModel(), engine = try XCTUnwrap(model.engine)

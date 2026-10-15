@@ -310,7 +310,10 @@ final class PaintEngine: ObservableObject {
         var document = DocumentSnapshot(width: width, height: height,
             layers: layers.map { .init(properties: $0.properties, pixels: read($0.texture)) },
             selectedLayerID: selectedLayerID ?? layers[0].id)
-        document.id = documentID; document.brush = brush; document.color = color
+        document.id = documentID
+        // Fill shares the live controls but must never replace the saved pen.
+        document.brush = tool.isBrush ? brush : rememberedDrawingBrush
+        document.color = color
         return document
     }
     func load(_ snapshot: DocumentSnapshot) throws {

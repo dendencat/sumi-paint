@@ -119,7 +119,7 @@ struct ColorPanel: View {
         }
         .disabled(engine.isBusy || engine.strokeActive)
         .onAppear { hex = activeColor.hex }
-        .onChange(of: activeColor) { _, value in if !hexFocused { hex = value.hex; invalidHex = false } }
+        .onChange(of: activeColor) { _, value in hex = value.hex; invalidHex = false }
         .onChange(of: editingBackground) { _, _ in hex = activeColor.hex; invalidHex = false }
         .onChange(of: hexFocused) { _, focused in if !focused { commitHex() } }
     }
@@ -140,7 +140,6 @@ struct ColorPanel: View {
                     .overlay(Rectangle().stroke(activeColor.hex == color.hex ? Color.white : Color.clear, lineWidth: 2))
                     .contentShape(Rectangle())
                     .onTapGesture { selection.wrappedValue = color }
-                    .onLongPressGesture { if saved { engine.removeSavedColor(color) } }
                     .contextMenu { if saved { Button("カラーセットから削除", role: .destructive) { engine.removeSavedColor(color) } } }
                     .accessibilityElement().accessibilityLabel("\(saved ? "カラーセット" : "最近使った色") \(color.hex)")
                     .accessibilityAddTraits(activeColor.hex == color.hex ? [.isButton, .isSelected] : [.isButton])
@@ -336,7 +335,9 @@ struct LayerPanel: View {
     private func finishName() {
         guard let id = editingID else { return }
         editingID = nil; focusedNameID = nil
-        engine.changeLayer(id) { $0.name = name }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        engine.changeLayer(id) { $0.name = trimmed }
     }
     private func icon(_ image: String, label: String, action: @escaping () -> Void) -> some View {
         Button(action: action) { Image(systemName: image).frame(minWidth: 16, minHeight: 26) }.help(label).accessibilityLabel(label)
