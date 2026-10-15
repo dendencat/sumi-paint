@@ -311,8 +311,8 @@ final class PaintEngine: ObservableObject {
             layers: layers.map { .init(properties: $0.properties, pixels: read($0.texture)) },
             selectedLayerID: selectedLayerID ?? layers[0].id)
         document.id = documentID
-        // Fill shares the live controls but must never replace the saved pen.
-        document.brush = tool.isBrush ? brush : rememberedDrawingBrush
+        // Only drawing tools may replace the saved pen/pencil settings.
+        document.brush = tool == .pen || tool == .pencil ? brush : rememberedDrawingBrush
         document.color = color
         return document
     }

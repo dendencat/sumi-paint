@@ -113,6 +113,11 @@ private struct EditorWorkspace: View {
             VStack(spacing: 0) {
                 header
                 Divider()
+                if model.recoveryStorageNeedsAttention {
+                    Button("復旧ファイルが256 MB以上あります。不要な版を整理", systemImage: "externaldrive.badge.exclamationmark") {
+                        model.refreshRecoveryEntries(); model.showRecoveryManager = true
+                    }.font(.caption).padding(8)
+                }
                 #if os(macOS)
                 quickBrush
                 Divider()

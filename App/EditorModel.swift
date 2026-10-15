@@ -45,6 +45,10 @@ final class EditorModel: ObservableObject {
     #endif
     private let defaults: UserDefaults
     private var acknowledgedRecoveries: [String: Double]
+    private var resolvedRecoveries: [String: Double] {
+        get { defaults.dictionary(forKey: "recovery.resolved") as? [String: Double] ?? [:] }
+        set { defaults.set(newValue, forKey: "recovery.resolved") }
+    }
     private var adoptedRecoveryURL: URL?
     private var writtenRecoveryURLs: Set<URL> = []
     private var exportedSnapshot: (id: UUID, revision: UInt64)?
@@ -118,6 +122,8 @@ final class EditorModel: ObservableObject {
             recoverySchedule.reset()
             let url = adoptedRecoveryURL ?? recoveryFolder.appendingPathComponent("\(snapshot.id.uuidString)-\(sessionID.uuidString).sumipaint")
             try await writer.write(snapshot, revision: revision, to: url)
+            // New edits are a new, unreviewed version, even at an adopted path.
+            resolvedRecoveries.removeValue(forKey: url.standardizedFileURL.path)
             writtenRecoveryURLs.insert(url)
             latestWrittenRevision = max(latestWrittenRevision ?? 0, revision)
             pruneRecoveries()
@@ -135,19 +141,21 @@ final class EditorModel: ObservableObject {
         if let adoptedRecoveryURL { return [adoptedRecoveryURL] }
         return [recoveryFolder.appendingPathComponent("\(engine.documentID.uuidString)-\(sessionID.uuidString).sumipaint")]
     }
+    var recoveryStorageNeedsAttention: Bool {
+        recoveryEntries.reduce(0) { $0 + $1.bytes } >= 256 * 1024 * 1024
+    }
     private func pruneRecoveries() {
         var protected = protectedRecoveryURLs
         for model in RecoverySessions.shared.active { protected.formUnion(model.protectedRecoveryURLs) }
-        // All remaining checkpoints may be the only editable copy. Read/quit
-        // acknowledgements suppress alerts only; export removes its exact version.
-        do { try RecoveryCatalog.prune(in: recoveryFolder, protected: protected) }
+        // Read/quit acknowledgements suppress alerts only. Successfully restored
+        // versions may be pruned once no editor is using them.
+        do { try RecoveryCatalog.prune(in: recoveryFolder, protected: protected, savedVersions: resolvedRecoveries) }
         catch { engine?.errorMessage = "古い復旧ファイルを整理できません: \(error.localizedDescription)" }
     }
     func acknowledgeRecovery(_ url: URL) {
+        refreshRecoveryEntries()
         guard let entry = recoveryEntries.first(where: { $0.url.standardizedFileURL.path == url.standardizedFileURL.path }) else { return }
         acknowledgedRecoveries[url.standardizedFileURL.path] = entry.modified.timeIntervalSince1970
-        let latest = acknowledgedRecoveries.sorted { $0.value > $1.value }.prefix(32)
-        acknowledgedRecoveries = Dictionary(uniqueKeysWithValues: latest.map { ($0.key, $0.value) })
         defaults.set(acknowledgedRecoveries, forKey: "recovery.acknowledged")
     }
     func dismissRecoveryPrompt() {
@@ -174,7 +182,14 @@ final class EditorModel: ObservableObject {
         } catch { engine.errorMessage = "保存済みの復旧ファイルを整理できません: \(error.localizedDescription)" }
     }
     func refreshRecoveryEntries() {
-        do { recoveryEntries = try RecoveryCatalog.entries(in: recoveryFolder) }
+        do {
+            recoveryEntries = try RecoveryCatalog.entries(in: recoveryFolder)
+            let paths = Set(recoveryEntries.map { $0.url.standardizedFileURL.path })
+            acknowledgedRecoveries = (defaults.dictionary(forKey: "recovery.acknowledged") as? [String: Double] ?? [:])
+                .filter { paths.contains($0.key) }
+            defaults.set(acknowledgedRecoveries, forKey: "recovery.acknowledged")
+            resolvedRecoveries = resolvedRecoveries.filter { paths.contains($0.key) }
+        }
         catch { engine?.errorMessage = "復旧ファイルの一覧を取得できません。" }
     }
     func removeRecovery(_ entry: RecoveryEntry) {
@@ -205,6 +220,7 @@ final class EditorModel: ObservableObject {
                 try engine.newDocument(width: width, height: height)
                 adoptedRecoveryURL = nil; latestWrittenRevision = nil; showNewCanvas = false; status = "新しいキャンバス"
                 hasWork = false; recoverySchedule.reset()
+                pruneRecoveries(); refreshRecoveryEntries()
             } catch { engine.errorMessage = error.localizedDescription }
         }
     }
@@ -225,6 +241,8 @@ final class EditorModel: ObservableObject {
         Task {
             defer { fileBusy = false }
             do {
+                refreshRecoveryEntries()
+                let recovery = recoveryEntries.first { $0.url.standardizedFileURL.path == url.standardizedFileURL.path }
                 let data = try await Task.detached(priority: .userInitiated) {
                     let access = url.startAccessingSecurityScopedResource()
                     defer { if access { url.stopAccessingSecurityScopedResource() } }
@@ -239,11 +257,20 @@ final class EditorModel: ObservableObject {
                     let snapshot = try await Task.detached(priority: .userInitiated) { try DocumentSnapshot.decode(data) }.value
                     guard await saveRecovery() else { return }
                     try engine.load(snapshot); latestWrittenRevision = nil
-                    let candidate = recoveryEntries.first(where: { $0.url.standardizedFileURL.path == url.standardizedFileURL.path })?.url
+                    let candidate = recovery?.url
                     let inUse = RecoverySessions.shared.active.contains { model in
                         model !== self && model.protectedRecoveryURLs.contains(where: { $0.standardizedFileURL.path == candidate?.standardizedFileURL.path })
                     }
                     adoptedRecoveryURL = inUse ? nil : candidate
+                    if let recovery {
+                        resolvedRecoveries[recovery.url.standardizedFileURL.path] = recovery.modified.timeIntervalSince1970
+                        // Loading commits an engine revision but does not create
+                        // new artwork that needs to overwrite this checkpoint.
+                        if adoptedRecoveryURL != nil {
+                            latestWrittenRevision = engine.contentRevision; recoverySchedule.reset()
+                        }
+                    }
+                    pruneRecoveries(); refreshRecoveryEntries()
                 }
                 status = "\(url.deletingPathExtension().lastPathComponent)を開きました"
             } catch { engine.errorMessage = error.localizedDescription }

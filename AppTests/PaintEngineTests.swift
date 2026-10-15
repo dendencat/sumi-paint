@@ -420,16 +420,17 @@ final class PaintEngineTests: XCTestCase {
         engine.setTool(.eraser); XCTAssertEqual(engine.brush.opacity, 0.1)
     }
 
-    func testSavingFromFillPreservesDrawingBrushInsteadOfFillControls() async throws {
+    func testSavingFromOtherToolsPreservesDrawingBrush() async throws {
         let engine = try makeEngine()
         for drawingTool in [EditorTool.pen, .pencil] {
             engine.setTool(drawingTool)
             engine.brush.opacity = 0.23; engine.brush.size = 37; engine.brush.hardness = 0.42
             let drawingBrush = engine.brush
-            engine.setTool(.eraser); engine.brush.opacity = 0.1
-            engine.setTool(.fill); engine.brush.opacity = 0.7
-            for tool in [EditorTool.fill, .eyedropper, .hand] {
+            engine.setTool(.eraser); engine.brush.opacity = 0.1; engine.brush.size = 83
+            let eraser = engine.brush
+            for tool in [EditorTool.eraser, .fill, .eyedropper, .hand] {
                 engine.setTool(tool)
+                if tool == .fill { engine.brush.opacity = 0.7 }
                 let snapshot = try DocumentSnapshot.decode(engine.snapshot().encoded())
                 XCTAssertEqual(snapshot.brush, drawingBrush)
                 let restored = try makeEngine()
@@ -438,6 +439,7 @@ final class PaintEngineTests: XCTestCase {
                 XCTAssertEqual(restored.brush, drawingBrush)
             }
             engine.setTool(.fill); XCTAssertEqual(engine.brush.opacity, 0.7)
+            engine.setTool(.eraser); XCTAssertEqual(engine.brush, eraser)
         }
     }
 
@@ -644,6 +646,113 @@ final class PaintEngineTests: XCTestCase {
             }
         }
     }
+    func testAcknowledgementsKeepAllExistingFilesAndDropDeletedRecords() async throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let suite = "SumiPaintTests.ManyRecoveries.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: folder) }
+        let snapshot = try makeEngine().snapshot(), writer = RecoveryWriter(), now = Date()
+        for index in 0..<33 {
+            let url = folder.appendingPathComponent("\(index).sumipaint")
+            try await writer.write(snapshot, revision: 1, to: url)
+            try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(-Double(index))], ofItemAtPath: url.path)
+        }
+        let entries = try RecoveryCatalog.entries(in: folder), oldest = try XCTUnwrap(entries.last)
+        let missing = folder.appendingPathComponent("missing.sumipaint").standardizedFileURL.path
+        var read = Dictionary(uniqueKeysWithValues: entries.dropLast().map {
+            ($0.url.standardizedFileURL.path, $0.modified.timeIntervalSince1970)
+        })
+        read[missing] = now.timeIntervalSince1970
+        defaults.set(read, forKey: "recovery.acknowledged")
+        let model = EditorModel(recoveryFolder: folder, idleDelay: 100, defaults: defaults)
+        defer { model.acknowledgeCleanExit() }
+        XCTAssertEqual(model.recoveryURL, oldest.url)
+        XCTAssertNil(defaults.dictionary(forKey: "recovery.acknowledged")?[missing])
+        model.dismissRecoveryPrompt()
+        XCTAssertEqual(defaults.dictionary(forKey: "recovery.acknowledged")?.count, 33)
+        let next = EditorModel(recoveryFolder: folder, idleDelay: 100, defaults: defaults)
+        defer { next.acknowledgeCleanExit() }
+        XCTAssertNil(next.recoveryURL, "The oldest of 33 acknowledged versions must stay acknowledged")
+        XCTAssertEqual(next.recoveryEntries.count, 33, "Dismissing the prompt must not grant deletion permission")
+        next.removeRecovery(oldest)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: oldest.url.path))
+        XCTAssertNil(defaults.dictionary(forKey: "recovery.acknowledged")?[oldest.url.standardizedFileURL.path])
+        // Files deleted outside the application are also removed from the records.
+        try FileManager.default.removeItem(at: entries[0].url)
+        next.refreshRecoveryEntries()
+        XCTAssertEqual(defaults.dictionary(forKey: "recovery.acknowledged")?.count, 31)
+        XCTAssertEqual(next.recoveryEntries.count, 31)
+    }
+
+    func testRestoredVersionsBecomePrunableAfterSwitchOrRestartButNewEditsStayProtected() async throws {
+        for action in ["switch", "restart", "edit", "failed"] {
+            let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            let suite = "SumiPaintTests.ResolvedRecovery.\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+            defer { defaults.removePersistentDomain(forName: suite); try? FileManager.default.removeItem(at: folder) }
+            let snapshot = try makeEngine().snapshot(), writer = RecoveryWriter()
+            let restoredURL = folder.appendingPathComponent("restored.sumipaint")
+            let untouchedURL = folder.appendingPathComponent("untouched.sumipaint")
+            for url in [restoredURL, untouchedURL] {
+                try await writer.write(snapshot, revision: 1, to: url)
+                try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-8 * 86400)], ofItemAtPath: url.path)
+            }
+            if action == "failed" { try Data([0]).write(to: restoredURL) }
+            let model = EditorModel(recoveryFolder: folder, idleDelay: 100, defaults: defaults)
+            defer { model.cancelRecoveryForTesting(); model.acknowledgeCleanExit() }
+            model.restoreRecovery(restoredURL)
+            while model.fileBusy { await Task.yield() }
+            if action == "failed" {
+                XCTAssertNotNil(model.engine?.errorMessage)
+                XCTAssertTrue((defaults.dictionary(forKey: "recovery.resolved") ?? [:]).isEmpty)
+                continue
+            }
+            XCTAssertEqual(try model.engine?.snapshot(), snapshot)
+            XCTAssertNotNil(defaults.dictionary(forKey: "recovery.resolved")?[restoredURL.standardizedFileURL.path])
+            XCTAssertTrue(FileManager.default.fileExists(atPath: restoredURL.path), "The active restored version is protected")
+            if action == "edit" {
+                stroke(try XCTUnwrap(model.engine), from: .init(8, 32), to: .init(56, 32))
+                let saved = await model.saveRecovery(); XCTAssertTrue(saved)
+                XCTAssertNil(defaults.dictionary(forKey: "recovery.resolved")?[restoredURL.standardizedFileURL.path])
+                try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-8 * 86400)], ofItemAtPath: restoredURL.path)
+            }
+            if action == "restart" {
+                model.cancelRecoveryForTesting(); model.acknowledgeCleanExit()
+                let next = EditorModel(recoveryFolder: folder, idleDelay: 100, defaults: defaults)
+                next.acknowledgeCleanExit()
+            } else {
+                model.newCanvas(width: 64, height: 64)
+                while model.fileBusy { await Task.yield() }
+            }
+            XCTAssertEqual(FileManager.default.fileExists(atPath: restoredURL.path), action == "edit")
+            XCTAssertEqual(try DocumentSnapshot.decode(Data(contentsOf: untouchedURL)), snapshot, "Unreviewed versions survive pruning")
+            if action != "edit" {
+                XCTAssertNil(defaults.dictionary(forKey: "recovery.resolved")?[restoredURL.standardizedFileURL.path])
+                XCTAssertNil(defaults.dictionary(forKey: "recovery.acknowledged")?[restoredURL.standardizedFileURL.path])
+            }
+        }
+    }
+
+    func testRecoveryStorageWarningKeepsUnreviewedFiles() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let suite = "SumiPaintTests.RecoveryStorage.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let url = folder.appendingPathComponent("large.sumipaint")
+        XCTAssertTrue(FileManager.default.createFile(atPath: url.path, contents: nil))
+        let file = try FileHandle(forWritingTo: url)
+        defer { try? file.close() }
+        try file.truncate(atOffset: 256 * 1024 * 1024)
+        let model = EditorModel(recoveryFolder: folder, defaults: defaults)
+        defer { model.acknowledgeCleanExit() }
+        XCTAssertTrue(model.recoveryStorageNeedsAttention)
+        XCTAssertEqual(model.recoveryEntries.map { $0.url.standardizedFileURL }, [url.standardizedFileURL])
+        model.removeRecovery(try XCTUnwrap(model.recoveryEntries.first))
+        XCTAssertFalse(model.recoveryStorageNeedsAttention)
+    }
+
     func testSuccessfulDocumentExportRemovesOnlyMatchingRecovery() async throws {
         let (model, folder) = try recoveryModel(), engine = try XCTUnwrap(model.engine)
         try engine.newDocument(width: 64, height: 64)

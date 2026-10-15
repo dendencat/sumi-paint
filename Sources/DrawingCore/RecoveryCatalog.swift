@@ -19,8 +19,8 @@ public enum RecoveryCatalog {
                 return RecoveryEntry(url: url, modified: values.contentModificationDate ?? .distantPast, bytes: values.fileSize ?? 0)
             }.sorted { $0.modified > $1.modified }
     }
-    /// Apply retention only to versions known to have an editable copy saved
-    /// elsewhere. Notification acknowledgements never grant deletion permission.
+    /// Apply retention only to explicitly resolved versions (restored, discarded,
+    /// or saved elsewhere). Notification acknowledgements never permit deletion.
     public static func prune(in folder: URL, maximumEntries: Int = 5,
                              maximumAge: TimeInterval = 7 * 24 * 60 * 60,
                              maximumBytes: Int = 256 * 1024 * 1024,
