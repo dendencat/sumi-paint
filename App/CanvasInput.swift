@@ -48,9 +48,19 @@ final class CanvasPointer {
         if !cancelled, !moving, (engine.tool == .rectangle || engine.tool == .lasso), polygon.count >= 3 {
             engine.select(polygon: polygon)
         }
+        if start != nil, !cancelled, !moving, engine.tool == .eyedropper { engine.rememberColor() }
         start = nil; polygon = []; moving = false; lastViewPoint = nil; lastPressure = nil; onPath?([])
     }
     func undoIncludingStroke() { end(); engine.undo() }
+    func undoGesture() { end(cancelled: true); engine.undo() }
+    /// Finger navigation may discard provisional finger ink, but must never
+    /// cancel or change the viewport under an active Pencil stroke.
+    @discardableResult
+    func beginNavigationGesture(pencilActive: Bool) -> Bool {
+        guard !pencilActive else { return false }
+        end(cancelled: true)
+        return true
+    }
 }
 
 struct PaintCanvas: View {
@@ -128,7 +138,7 @@ final class TouchCanvas: MTKView, MTKViewDelegate, UIGestureRecognizerDelegate {
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
     func draw(in view: MTKView) { engine.render(in: view) }
     override func gestureRecognizerShouldBegin(_ recognizer: UIGestureRecognizer) -> Bool {
-        guard !engine.isBusy else { return false }
+        guard !engine.isBusy, activeTouch?.type != .pencil else { return false }
         if let pan = recognizer as? UIPanGestureRecognizer, pan.maximumNumberOfTouches == 1 {
             return engine.tool == .hand || !engine.fingerDrawing
         }
@@ -138,30 +148,43 @@ final class TouchCanvas: MTKView, MTKViewDelegate, UIGestureRecognizerDelegate {
         !(recognizer is UITapGestureRecognizer) && !(other is UITapGestureRecognizer)
     }
     @objc private func pan(_ recognizer: UIPanGestureRecognizer) {
-        if recognizer.state == .began { pointer.end(); activeTouch = nil }
+        guard activeTouch?.type != .pencil else { recognizer.setTranslation(.zero, in: self); return }
+        if recognizer.state == .began { pointer.beginNavigationGesture(pencilActive: false); activeTouch = nil }
         let translation = recognizer.translation(in: self)
         engine.viewport.pan.x += Double(translation.x); engine.viewport.pan.y += Double(translation.y)
         recognizer.setTranslation(.zero, in: self); setNeedsDisplay()
     }
     @objc private func pinch(_ recognizer: UIPinchGestureRecognizer) {
-        if recognizer.state == .began { pointer.end(); activeTouch = nil }
+        guard activeTouch?.type != .pencil else { recognizer.scale = 1; return }
+        if recognizer.state == .began { pointer.beginNavigationGesture(pencilActive: false); activeTouch = nil }
         let anchor = recognizer.location(in: self)
         engine.viewport.zoom(by: Double(recognizer.scale), around: .init(Double(anchor.x), Double(anchor.y)))
         recognizer.scale = 1; setNeedsDisplay()
     }
     @objc private func rotate(_ recognizer: UIRotationGestureRecognizer) {
-        if recognizer.state == .began { pointer.end(); activeTouch = nil }
+        guard activeTouch?.type != .pencil else { recognizer.rotation = 0; return }
+        if recognizer.state == .began { pointer.beginNavigationGesture(pencilActive: false); activeTouch = nil }
         engine.viewport.angle += Double(recognizer.rotation); recognizer.rotation = 0; setNeedsDisplay()
     }
-    @objc private func twoFingerTap() { pointer.undoIncludingStroke(); activeTouch = nil }
+    @objc private func twoFingerTap() {
+        guard activeTouch?.type != .pencil else { return }
+        pointer.undoGesture(); activeTouch = nil
+    }
     private func pressure(_ touch: UITouch) -> Double? {
         guard touch.type == .pencil, touch.maximumPossibleForce > 0, touch.force > 0 else { return nil }
         return min(1, Double(touch.force / touch.maximumPossibleForce))
     }
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        let pencil = touches.first(where: { $0.type == .pencil })
+        let fingers = event?.allTouches?.filter { $0.type == .direct && ($0.phase == .began || $0.phase == .moved || $0.phase == .stationary) }.count ?? 0
+        if activeTouch?.type != .pencil, pencil != nil {
+            pointer.end(cancelled: true); activeTouch = nil
+        }
+        if fingers > 1, activeTouch?.type != .pencil, pencil == nil {
+            pointer.end(cancelled: true); activeTouch = nil; return
+        }
         guard activeTouch == nil, !engine.isBusy,
-              let touch = touches.first(where: { $0.type == .pencil || engine.fingerDrawing }),
-              engine.tool != .hand else { return }
+              let touch = pencil ?? touches.first(where: { $0.type == .direct && engine.fingerDrawing && engine.tool != .hand }) else { return }
         activeTouch = touch
         let point = touch.location(in: self)
         pointer.begin(point: .init(Double(point.x), Double(point.y)), time: touch.timestamp, pressure: pressure(touch))
@@ -182,8 +205,8 @@ final class TouchCanvas: MTKView, MTKViewDelegate, UIGestureRecognizerDelegate {
     }
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let touch = activeTouch, touches.contains(touch) else { return }
-        // UIKit cancels touches when a gesture claims them. Preserve the ink as an undoable edit.
-        pointer.end(); activeTouch = nil
+        // A gesture has claimed this contact; discard its provisional ink.
+        pointer.end(cancelled: true); activeTouch = nil
     }
 }
 #else
@@ -247,8 +270,8 @@ final class MouseCanvas: MTKView, MTKViewDelegate {
     }
     @objc private func windowLostFocus(_ notification: Notification) { resetInput() }
     @objc private func windowGainedFocus(_ notification: Notification) { applyEraserProximity() }
-    private func resetInput() {
-        toolInput.reset(); pressedButtons = []; buttonActions = [:]
+    private func resetInput(cancelled: Bool = false) {
+        toolInput.reset(cancelled: cancelled); pressedButtons = []; buttonActions = [:]
     }
     func updateTabletProximity(isEntering: Bool, eraser: Bool) {
         eraserInProximity = isEntering && eraser
@@ -375,11 +398,11 @@ final class MouseCanvas: MTKView, MTKViewDelegate {
             if !event.isARepeat { toolInput.press("space", tool: .hand) }
             return
         }
-        if event.keyCode == 53 { resetInput(); return }
+        if event.keyCode == 53 { resetInput(cancelled: true); return }
         switch event.charactersIgnoringModifiers?.lowercased() {
         case "b": toolInput.select(.pen); case "p": toolInput.select(.pencil); case "e": toolInput.select(.eraser)
         case "g": toolInput.select(.fill); case "i": toolInput.select(.eyedropper); case "h": toolInput.select(.hand)
-        case "x": if !event.isARepeat { toolInput.toggleEraser() }
+        case "x": if !event.isARepeat { pointer.end(); engine.swapColors() }
         case "[": engine.brush.size = max(1, engine.brush.size - 2)
         case "]": engine.brush.size = min(512, engine.brush.size + 2)
         default: super.keyDown(with: event)

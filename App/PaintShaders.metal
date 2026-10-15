@@ -51,10 +51,47 @@ fragment float4 brushFragment(DabVertex in [[stage_in]], texture2d<float> mask [
     return float4(in.color.rgb * alpha, alpha);
 }
 
+// The stamp texture stores the strongest coverage within one stroke. Resolve
+// against the immutable original so overlapping dabs never build up opacity.
+kernel void resolveStroke(texture2d<float, access::read> original [[texture(0)]],
+                          texture2d<float, access::read> coverage [[texture(1)]],
+                          texture2d<float, access::write> output [[texture(2)]],
+                          constant uint2 &origin [[buffer(0)]], constant uint2 &mode [[buffer(1)]],
+                          uint2 gid [[thread_position_in_grid]]) {
+    uint2 point = origin + gid;
+    if (point.x >= output.get_width() || point.y >= output.get_height()) return;
+    float4 dst = original.read(point), src = coverage.read(point);
+    if (mode.x) output.write(dst * (1 - src.a), point);
+    else if (mode.y) output.write(float4(src.rgb * dst.a + dst.rgb * (1 - src.a), dst.a), point);
+    else output.write(src + dst * (1 - src.a), point);
+}
+
 kernel void clearRegion(texture2d<float, access::write> output [[texture(0)]],
                         constant uint2 &origin [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
     uint2 point = origin + gid;
     if (point.x < output.get_width() && point.y < output.get_height()) output.write(float4(0), point);
+}
+
+// Downsample directly into the small readback texture. Letterbox rectangular
+// canvases and average linear samples to retain thin marks when reducing.
+kernel void thumbnailLayer(texture2d<float, access::sample> source [[texture(0)]],
+                           texture2d<float, access::write> output [[texture(1)]],
+                           uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= output.get_width() || gid.y >= output.get_height()) return;
+    float2 canvas = float2(source.get_width(), source.get_height());
+    float2 size = float2(output.get_width(), output.get_height());
+    float2 fitted = canvas * min(size.x / canvas.x, size.y / canvas.y);
+    float2 pixel = float2(gid) + 0.5f - (size - fitted) * 0.5f;
+    if (any(pixel < 0) || any(pixel >= fitted)) { output.write(float4(0), gid); return; }
+    constexpr sampler sample(filter::linear, address::clamp_to_edge);
+    float4 color = float4(0);
+    for (uint y = 0; y < 4; ++y) {
+        for (uint x = 0; x < 4; ++x) {
+            float2 offset = (float2(x, y) + 0.5f) / 4.0f - 0.5f;
+            color += source.sample(sample, (pixel + offset) / fitted);
+        }
+    }
+    output.write(color / 16.0f, gid);
 }
 kernel void compositeLayer(texture2d<float, access::read> destination [[texture(0)]],
                            texture2d<float, access::read> source [[texture(1)]],
@@ -65,7 +102,7 @@ kernel void compositeLayer(texture2d<float, access::read> destination [[texture(
     uint2 point = origin + gid;
     if (point.x >= output.get_width() || point.y >= output.get_height()) return;
     float4 dst = destination.read(point), src = source.read(point) * settings.x;
-    if (settings.z > 0.5f) src *= clipBase.read(point).a * settings.w;
+
     float3 result = src.rgb + dst.rgb * (1 - src.a);
     if (settings.y > 0.5f) {
         float3 s = src.a > 0 ? src.rgb / src.a : float3(0);
@@ -73,7 +110,14 @@ kernel void compositeLayer(texture2d<float, access::read> destination [[texture(
         float3 blend = settings.y < 1.5f ? s * d : 1 - (1 - s) * (1 - d);
         result = src.rgb * (1 - dst.a) + dst.rgb * (1 - src.a) + blend * src.a * dst.a;
     }
-    output.write(float4(result, src.a + dst.a * (1 - src.a)), point);
+    if (settings.z > 0.5f) {
+        float3 s = src.a > 0 ? src.rgb / src.a : float3(0);
+        float3 d = dst.a > 0 ? dst.rgb / dst.a : float3(0);
+        float3 blend = settings.y < 0.5f ? s : (settings.y < 1.5f ? s * d : 1 - (1 - s) * (1 - d));
+        output.write(float4(dst.rgb * (1 - src.a) + blend * src.a * dst.a, dst.a), point);
+    } else {
+        output.write(float4(result, src.a + dst.a * (1 - src.a)), point);
+    }
 }
 
 struct QuadVertex { float4 position [[position]]; float2 uv; };

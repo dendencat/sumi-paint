@@ -154,7 +154,9 @@ for platform in ("macOS", "iOS"):
         "CFBundleName": "Sumi Paint", "CFBundlePackageType": "APPL", "CFBundleShortVersionString": "$(MARKETING_VERSION)",
         "CFBundleVersion": "$(CURRENT_PROJECT_VERSION)",
         "UTExportedTypeDeclarations": [{"UTTypeIdentifier": "app.dendencat.sumipaint.document", "UTTypeDescription": "Sumi Paint作品",
-            "UTTypeConformsTo": ["public.data"], "UTTypeTagSpecification": {"public.filename-extension": ["sumipaint"]}}],
+            "UTTypeConformsTo": ["public.data"], "UTTypeTagSpecification": {"public.filename-extension": ["sumipaint"]}},
+            {"UTTypeIdentifier": "app.dendencat.sumipaint.layer", "UTTypeDescription": "Sumi Paintレイヤー",
+             "UTTypeConformsTo": ["public.data"]}],
     }
     if platform == "iOS":
         info.update(LSRequiresIPhoneOS=True, UILaunchScreen={},

@@ -27,6 +27,44 @@ public struct PaintColor: Codable, Equatable, Sendable {
     }
 }
 
+public extension PaintColor {
+    var hex: String {
+        String(format: "#%02X%02X%02X", Int((red * 255).rounded()), Int((green * 255).rounded()), Int((blue * 255).rounded()))
+    }
+    init?(hex: String) {
+        let trimmed = hex.trimmingCharacters(in: .whitespacesAndNewlines)
+        let digits = trimmed.hasPrefix("#") ? String(trimmed.dropFirst()) : trimmed
+        guard digits.count == 6, digits.allSatisfy({ $0.isASCII && $0.isHexDigit }), let value = UInt32(digits, radix: 16) else { return nil }
+        self.init(Double((value >> 16) & 255) / 255, Double((value >> 8) & 255) / 255, Double(value & 255) / 255)
+    }
+    var hsv: (hue: Double, saturation: Double, value: Double) {
+        let high = max(red, green, blue), low = min(red, green, blue), delta = high - low
+        var hue = 0.0
+        if delta > 0 {
+            if high == red { hue = ((green - blue) / delta).truncatingRemainder(dividingBy: 6) }
+            else if high == green { hue = (blue - red) / delta + 2 }
+            else { hue = (red - green) / delta + 4 }
+            hue /= 6
+            if hue < 0 { hue += 1 }
+        }
+        return (hue, high == 0 ? 0 : delta / high, high)
+    }
+    init(hue: Double, saturation: Double, value: Double) {
+        let h = (hue - floor(hue)) * 6, chroma = value * saturation
+        let x = chroma * (1 - abs(h.truncatingRemainder(dividingBy: 2) - 1)), m = value - chroma
+        let rgb: (Double, Double, Double)
+        switch Int(h) {
+        case 0: rgb = (chroma, x, 0)
+        case 1: rgb = (x, chroma, 0)
+        case 2: rgb = (0, chroma, x)
+        case 3: rgb = (0, x, chroma)
+        case 4: rgb = (x, 0, chroma)
+        default: rgb = (chroma, 0, x)
+        }
+        self.init(rgb.0 + m, rgb.1 + m, rgb.2 + m)
+    }
+}
+
 public enum BrushKind: String, Codable, CaseIterable, Sendable {
     case pen, pencil, eraser
 }

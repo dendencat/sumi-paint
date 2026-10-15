@@ -5,6 +5,7 @@ struct RecoveryManager: View {
     @State private var pendingDeletion: RecoveryEntry?
     var body: some View {
         NavigationStack {
+            VStack(spacing: 8) {
             Group {
                 if model.recoveryEntries.isEmpty {
                     ContentUnavailableView("復旧ファイルはありません", systemImage: "clock.arrow.circlepath")
@@ -28,6 +29,9 @@ struct RecoveryManager: View {
                         }.padding(.vertical, 4)
                     }
                 }
+            }
+            Text("未復元の復旧版は、通知を確認済みでも期間・件数・容量にかかわらず保持します。復元済みの版は編集中を除いて整理対象です。その後の編集は再び保護します。不要な版はここで削除できます。作品として保存した版と一致する復旧版は削除します。")
+                .font(.caption).foregroundStyle(.secondary).padding(8)
             }
             .navigationTitle("復旧ファイル")
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("閉じる") { model.showRecoveryManager = false } } }

@@ -43,25 +43,37 @@ final class EditorModel: ObservableObject {
     #if DEBUG
     func cancelRecoveryForTesting() { recoveryTask?.cancel() }
     #endif
+    private let defaults: UserDefaults
+    private var acknowledgedRecoveries: [String: Double]
+    private var resolvedRecoveries: [String: Double] {
+        get { defaults.dictionary(forKey: "recovery.resolved") as? [String: Double] ?? [:] }
+        set { defaults.set(newValue, forKey: "recovery.resolved") }
+    }
+    private var adoptedRecoveryURL: URL?
+    private var writtenRecoveryURLs: Set<URL> = []
+    private var exportedSnapshot: (id: UUID, revision: UInt64)?
     private let sessionID = UUID()
     private let writer = RecoveryWriter()
     private var latestWrittenRevision: UInt64?
     private let recoveryFolder: URL
-    init(recoveryFolder: URL? = nil, idleDelay: Double = 2, maximumInterval: Double = 10) {
+    init(recoveryFolder: URL? = nil, idleDelay: Double = 2, maximumInterval: Double = 10, defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        acknowledgedRecoveries = defaults.dictionary(forKey: "recovery.acknowledged") as? [String: Double] ?? [:]
         self.recoveryFolder = recoveryFolder ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("SumiPaint/Recovery", isDirectory: true)
         recoverySchedule = .init(idleDelay: idleDelay, maximumInterval: maximumInterval)
         do {
-            let engine = try PaintEngine(); self.engine = engine
+            let engine = try PaintEngine(defaults: defaults); self.engine = engine
             #if os(iOS)
             engine.fingerDrawing = UIDevice.current.userInterfaceIdiom == .phone
             #endif
             engine.onContentChange = { [weak self] in self?.hasWork = true; self?.scheduleRecovery() }
+            pruneRecoveries()
             refreshRecoveryEntries()
-            recoveryURL = recoveryEntries.first?.url
-            #if os(macOS)
+            recoveryURL = recoveryEntries.first(where: {
+                $0.modified.timeIntervalSince1970 > (acknowledgedRecoveries[$0.url.standardizedFileURL.path] ?? 0)
+            })?.url
             RecoverySessions.shared.add(self)
-            #endif
         } catch { engine = nil; startupError = error.localizedDescription }
     }
     private func scheduleRecovery() {
@@ -108,9 +120,13 @@ final class EditorModel: ObservableObject {
         do {
             let snapshot = try engine.snapshot()
             recoverySchedule.reset()
-            let url = recoveryFolder.appendingPathComponent("\(snapshot.id.uuidString)-\(sessionID.uuidString).sumipaint")
+            let url = adoptedRecoveryURL ?? recoveryFolder.appendingPathComponent("\(snapshot.id.uuidString)-\(sessionID.uuidString).sumipaint")
             try await writer.write(snapshot, revision: revision, to: url)
+            // New edits are a new, unreviewed version, even at an adopted path.
+            resolvedRecoveries.removeValue(forKey: url.standardizedFileURL.path)
+            writtenRecoveryURLs.insert(url)
             latestWrittenRevision = max(latestWrittenRevision ?? 0, revision)
+            pruneRecoveries()
             refreshRecoveryEntries()
             if engine.contentRevision == revision { status = "復旧用に自動保存済み" }
             return true
@@ -120,8 +136,60 @@ final class EditorModel: ObservableObject {
             engine.errorMessage = "自動保存に失敗しました: \(error.localizedDescription)"; return false
         }
     }
+    var protectedRecoveryURLs: Set<URL> {
+        guard let engine else { return [] }
+        if let adoptedRecoveryURL { return [adoptedRecoveryURL] }
+        return [recoveryFolder.appendingPathComponent("\(engine.documentID.uuidString)-\(sessionID.uuidString).sumipaint")]
+    }
+    var recoveryStorageNeedsAttention: Bool {
+        recoveryEntries.reduce(0) { $0 + $1.bytes } >= 256 * 1024 * 1024
+    }
+    private func pruneRecoveries() {
+        var protected = protectedRecoveryURLs
+        for model in RecoverySessions.shared.active { protected.formUnion(model.protectedRecoveryURLs) }
+        // Read/quit acknowledgements suppress alerts only. Successfully restored
+        // versions may be pruned once no editor is using them.
+        do { try RecoveryCatalog.prune(in: recoveryFolder, protected: protected, savedVersions: resolvedRecoveries) }
+        catch { engine?.errorMessage = "古い復旧ファイルを整理できません: \(error.localizedDescription)" }
+    }
+    func acknowledgeRecovery(_ url: URL) {
+        refreshRecoveryEntries()
+        guard let entry = recoveryEntries.first(where: { $0.url.standardizedFileURL.path == url.standardizedFileURL.path }) else { return }
+        acknowledgedRecoveries[url.standardizedFileURL.path] = entry.modified.timeIntervalSince1970
+        defaults.set(acknowledgedRecoveries, forKey: "recovery.acknowledged")
+    }
+    func dismissRecoveryPrompt() {
+        if let recoveryURL { acknowledgeRecovery(recoveryURL) }
+        recoveryURL = nil
+    }
+    /// Unsaved artwork must survive a normal quit. Acknowledge these checkpoints
+    /// so only a newer, interrupted session prompts automatically next launch.
+    func acknowledgeCleanExit() {
+        for url in writtenRecoveryURLs { acknowledgeRecovery(url) }
+        RecoverySessions.shared.remove(self)
+    }
+    private func removeExportedRecovery(id: UUID, revision: UInt64) async {
+        if let recoverySave { _ = await recoverySave.value }
+        guard let engine, engine.documentID == id, engine.contentRevision == revision else { return }
+        do {
+            for entry in try RecoveryCatalog.entries(in: recoveryFolder) where
+                entry.url.lastPathComponent.hasPrefix("\(id.uuidString)-\(sessionID.uuidString)") || entry.url.standardizedFileURL.path == adoptedRecoveryURL?.standardizedFileURL.path {
+                try RecoveryCatalog.remove(entry, from: recoveryFolder)
+                writtenRecoveryURLs.remove(entry.url)
+            }
+            hasWork = false; recoverySchedule.reset(); recoveryTask?.cancel()
+            latestWrittenRevision = nil; refreshRecoveryEntries()
+        } catch { engine.errorMessage = "保存済みの復旧ファイルを整理できません: \(error.localizedDescription)" }
+    }
     func refreshRecoveryEntries() {
-        do { recoveryEntries = try RecoveryCatalog.entries(in: recoveryFolder) }
+        do {
+            recoveryEntries = try RecoveryCatalog.entries(in: recoveryFolder)
+            let paths = Set(recoveryEntries.map { $0.url.standardizedFileURL.path })
+            acknowledgedRecoveries = (defaults.dictionary(forKey: "recovery.acknowledged") as? [String: Double] ?? [:])
+                .filter { paths.contains($0.key) }
+            defaults.set(acknowledgedRecoveries, forKey: "recovery.acknowledged")
+            resolvedRecoveries = resolvedRecoveries.filter { paths.contains($0.key) }
+        }
         catch { engine?.errorMessage = "復旧ファイルの一覧を取得できません。" }
     }
     func removeRecovery(_ entry: RecoveryEntry) {
@@ -150,8 +218,9 @@ final class EditorModel: ObservableObject {
             guard await saveRecovery() else { return }
             do {
                 try engine.newDocument(width: width, height: height)
-                latestWrittenRevision = nil; showNewCanvas = false; status = "新しいキャンバス"
+                adoptedRecoveryURL = nil; latestWrittenRevision = nil; showNewCanvas = false; status = "新しいキャンバス"
                 hasWork = false; recoverySchedule.reset()
+                pruneRecoveries(); refreshRecoveryEntries()
             } catch { engine.errorMessage = error.localizedDescription }
         }
     }
@@ -172,6 +241,8 @@ final class EditorModel: ObservableObject {
         Task {
             defer { fileBusy = false }
             do {
+                refreshRecoveryEntries()
+                let recovery = recoveryEntries.first { $0.url.standardizedFileURL.path == url.standardizedFileURL.path }
                 let data = try await Task.detached(priority: .userInitiated) {
                     let access = url.startAccessingSecurityScopedResource()
                     defer { if access { url.stopAccessingSecurityScopedResource() } }
@@ -186,13 +257,27 @@ final class EditorModel: ObservableObject {
                     let snapshot = try await Task.detached(priority: .userInitiated) { try DocumentSnapshot.decode(data) }.value
                     guard await saveRecovery() else { return }
                     try engine.load(snapshot); latestWrittenRevision = nil
+                    let candidate = recovery?.url
+                    let inUse = RecoverySessions.shared.active.contains { model in
+                        model !== self && model.protectedRecoveryURLs.contains(where: { $0.standardizedFileURL.path == candidate?.standardizedFileURL.path })
+                    }
+                    adoptedRecoveryURL = inUse ? nil : candidate
+                    if let recovery {
+                        resolvedRecoveries[recovery.url.standardizedFileURL.path] = recovery.modified.timeIntervalSince1970
+                        // Loading commits an engine revision but does not create
+                        // new artwork that needs to overwrite this checkpoint.
+                        if adoptedRecoveryURL != nil {
+                            latestWrittenRevision = engine.contentRevision; recoverySchedule.reset()
+                        }
+                    }
+                    pruneRecoveries(); refreshRecoveryEntries()
                 }
                 status = "\(url.deletingPathExtension().lastPathComponent)を開きました"
             } catch { engine.errorMessage = error.localizedDescription }
         }
     }
     func restoreRecovery(_ url: URL) {
-        self.recoveryURL = nil; open(url, image: false)
+        dismissRecoveryPrompt(); open(url, image: false)
     }
     func prepareExport(png: Bool) {
         guard let engine, !fileBusy, !engine.isBusy, !engine.strokeActive else { return }
@@ -201,8 +286,10 @@ final class EditorModel: ObservableObject {
             defer { fileBusy = false }
             do {
                 let data: Data
+                exportedSnapshot = nil
                 if png { data = try engine.pngData() }
                 else {
+                    exportedSnapshot = (engine.documentID, engine.contentRevision)
                     let snapshot = try engine.snapshot()
                     data = try await Task.detached(priority: .userInitiated) { try snapshot.encoded() }.value
                 }
@@ -213,10 +300,14 @@ final class EditorModel: ObservableObject {
     }
     func handleExport(_ result: Result<URL, Error>) {
         switch result {
-        case .success: status = exportType == .png ? "PNGを書き出しました" : "作品を書き出しました"
+        case .success:
+            status = exportType == .png ? "PNGを書き出しました" : "作品を書き出しました"
+            if let saved = exportedSnapshot {
+                Task { await removeExportedRecovery(id: saved.id, revision: saved.revision) }
+            }
         case .failure(let error): engine?.errorMessage = error.localizedDescription
         }
-        exportFile = nil
+        exportedSnapshot = nil; exportFile = nil
     }
 }
 

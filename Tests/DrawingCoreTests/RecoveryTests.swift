@@ -41,4 +41,49 @@ final class RecoveryTests: XCTestCase {
         XCTAssertThrowsError(try RecoveryCatalog.remove(forged, from: folder))
         XCTAssertTrue(FileManager.default.fileExists(atPath: target.path))
     }
+    func testRetentionBoundsAgeCountBytesAndProtectsActiveFiles() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let now = Date()
+        var urls: [URL] = []
+        for index in 0..<7 {
+            let url = folder.appendingPathComponent("\(index).sumipaint"); urls.append(url)
+            try Data(repeating: 0, count: 10).write(to: url)
+            try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(-Double(index) * 86400)], ofItemAtPath: url.path)
+        }
+        let savedVersions = Dictionary(uniqueKeysWithValues: try RecoveryCatalog.entries(in: folder).map {
+            ($0.url.standardizedFileURL.path, $0.modified.timeIntervalSince1970)
+        })
+        try RecoveryCatalog.prune(in: folder, maximumEntries: 3, maximumAge: 3 * 86400,
+            maximumBytes: 30, now: now, protected: [urls[6]], savedVersions: savedVersions)
+        XCTAssertEqual(Set(try RecoveryCatalog.entries(in: folder).map { $0.url.standardizedFileURL }), Set([urls[0], urls[1], urls[6]].map(\.standardizedFileURL)))
+        try RecoveryCatalog.prune(in: folder, maximumEntries: 5, maximumAge: 86400,
+            maximumBytes: 10, now: now, savedVersions: savedVersions)
+        XCTAssertEqual(try RecoveryCatalog.entries(in: folder).map { $0.url.standardizedFileURL }, [urls[0].standardizedFileURL])
+    }
+
+    func testUnsavedVersionsSurviveAllRetentionLimits() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let now = Date()
+        for index in 0..<8 {
+            let url = folder.appendingPathComponent("\(index).sumipaint")
+            try Data(repeating: 0, count: 10).write(to: url)
+            try FileManager.default.setAttributes([.modificationDate: now.addingTimeInterval(-8 * 86400 - Double(index))], ofItemAtPath: url.path)
+        }
+        try RecoveryCatalog.prune(in: folder, maximumEntries: 1, maximumBytes: 1, now: now)
+        let entries = try RecoveryCatalog.entries(in: folder)
+        XCTAssertEqual(entries.count, 8)
+        var savedVersions = Dictionary(uniqueKeysWithValues: entries.map {
+            ($0.url.standardizedFileURL.path, $0.modified.timeIntervalSince1970)
+        })
+        // Saving an earlier version does not permit deletion of a newer checkpoint.
+        let updated = entries[0]
+        savedVersions[updated.url.standardizedFileURL.path] = updated.modified.timeIntervalSince1970 - 1
+        try RecoveryCatalog.prune(in: folder, maximumEntries: 1, maximumBytes: 1, now: now, savedVersions: savedVersions)
+        XCTAssertEqual(try RecoveryCatalog.entries(in: folder).map(\.url), [updated.url])
+    }
+
 }

@@ -1,6 +1,8 @@
 import Foundation
 import Combine
-import MetalKit
+// Metal resources may cross to their command's completion queue. The thumbnail
+// readback texture is read only after that command completes and is never reused.
+@preconcurrency import MetalKit
 import ImageIO
 import UniformTypeIdentifiers
 
@@ -26,6 +28,8 @@ enum EditorTool: String, CaseIterable, Sendable {
 final class PaintLayer: Identifiable {
     var properties: LayerProperties
     let texture: MTLTexture
+    let instanceID = UUID()
+    var pixelRevision: UInt64 = 0
     var id: UUID { properties.id }
     init(properties: LayerProperties, texture: MTLTexture) { self.properties = properties; self.texture = texture }
 }
@@ -40,7 +44,8 @@ enum EditRecord {
     case insert(PaintLayer, Int)
     case remove(PaintLayer, Int)
     case properties(UUID, LayerProperties, LayerProperties)
-    case reorder([UUID], [UUID])
+    case reorder([LayerProperties], [LayerProperties])
+    indirect case group([EditRecord])
     var byteCost: Int {
         switch self {
         case .pixels(_, let before, let after, let a, let b):
@@ -48,7 +53,9 @@ enum EditRecord {
             let afterBytes = after.reduce(0) { $0 + $1.data.count }
             let selectionBytes = (a?.count ?? 0) + (b?.count ?? 0)
             return beforeBytes + afterBytes + selectionBytes
-        case .insert(let layer, _), .remove(let layer, _): return layer.texture.width * layer.texture.height * 4
+        case .insert: return 1024
+        case .remove(let layer, _): return layer.texture.width * layer.texture.height * 4
+        case .group(let records): return records.reduce(0) { $0 + $1.byteCost }
         default: return 1024
         }
     }
@@ -68,25 +75,30 @@ private struct GPUView {
 final class PaintEngine: ObservableObject {
     let device: MTLDevice
     let queue: MTLCommandQueue
-    private let paintPipeline: MTLRenderPipelineState
-    private let erasePipeline: MTLRenderPipelineState
-    private let alphaPipeline: MTLRenderPipelineState
+    private let coveragePipeline: MTLRenderPipelineState
+    private let strokePipeline: MTLComputePipelineState
     let viewPipeline: MTLRenderPipelineState
     private let clearPipeline: MTLComputePipelineState
     private let compositePipeline: MTLComputePipelineState
+    private let thumbnailPipeline: MTLComputePipelineState
     @Published private(set) var layers: [PaintLayer] = []
     @Published var selectedLayerID: UUID?
     @Published var tool: EditorTool = .pen
     @Published var brush = BrushSettings()
+    private var toolBrushes: [EditorTool: BrushSettings] = [:]
     private(set) var rememberedDrawingTool: EditorTool = .pen
     private(set) var rememberedDrawingBrush = BrushSettings()
+    private let colorDefaults: UserDefaults
+    @Published var backgroundColor = PaintColor(1, 1, 1)
+    @Published private(set) var colorSet: [PaintColor] = [] { didSet { persistColors(colorSet, key: "palette.saved") } }
     @Published var color = PaintColor.ink
-    @Published var recentColors: [PaintColor] = [.ink, .init(0.87, 0.29, 0.38), .init(0.26, 0.5, 0.8), .init(0.2, 0.65, 0.5)]
+    @Published private(set) var recentColors: [PaintColor] = [] { didSet { persistColors(recentColors, key: "palette.recent") } }
     @Published var viewport = CanvasViewport()
     @Published var checkerboard = false
     @Published var fingerDrawing = false
     @Published var leftHanded = false
     @Published var fillTolerance = 12
+    @Published var fillExpansion = 1
     @Published var errorMessage: String?
     @Published private(set) var isBusy = false
     @Published private(set) var canUndo = false
@@ -119,6 +131,18 @@ final class PaintEngine: ObservableObject {
     private var composite: MTLTexture!
     private var scratchA: MTLTexture!
     private var scratchB: MTLTexture!
+    private var groupA: MTLTexture!
+    private var groupB: MTLTexture!
+    private var strokeBase: MTLTexture!
+    private var strokeCoverage: MTLTexture!
+    private var opacityEdit: (id: UUID, before: LayerProperties)?
+    private var thumbnails: [UUID: (revision: UInt64, image: CGImage)] = [:]
+    private var pendingThumbnails: Set<UUID> = []
+    private var thumbnailRefreshTask: Task<Void, Never>?
+    #if DEBUG
+    private(set) var thumbnailGenerationCount = 0
+    private(set) var thumbnailReadbackBytes = 0
+    #endif
     private var dirty: MTLRegion?
     private var undoRecords: [EditRecord] = []
     private var redoRecords: [EditRecord] = []
@@ -127,7 +151,8 @@ final class PaintEngine: ObservableObject {
     private var gpuWrittenTextures: [ObjectIdentifier: MTLTexture] = [:]
     private var inFlightCommandBuffers: [MTLCommandBuffer] = []
 
-    init() throws {
+    init(defaults: UserDefaults = .standard) throws {
+        colorDefaults = defaults
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue(),
               let library = device.makeDefaultLibrary(),
               let vertex = library.makeFunction(name: "brushVertex"),
@@ -135,30 +160,33 @@ final class PaintEngine: ObservableObject {
               let quad = library.makeFunction(name: "quadVertex"),
               let display = library.makeFunction(name: "canvasFragment"),
               let clear = library.makeFunction(name: "clearRegion"),
-              let compose = library.makeFunction(name: "compositeLayer") else {
+              let compose = library.makeFunction(name: "compositeLayer"),
+              let resolve = library.makeFunction(name: "resolveStroke"),
+              let thumbnail = library.makeFunction(name: "thumbnailLayer") else {
             throw PaintDocumentError.invalid("Metal描画機能を初期化できません。")
         }
         self.device = device; self.queue = queue
-        func pipeline(erase: Bool, alphaLock: Bool) throws -> MTLRenderPipelineState {
-            let description = MTLRenderPipelineDescriptor()
-            description.vertexFunction = vertex; description.fragmentFunction = fragment
-            let attachment = description.colorAttachments[0]!
-            attachment.pixelFormat = .rgba8Unorm; attachment.isBlendingEnabled = true
-            attachment.sourceRGBBlendFactor = erase ? .zero : (alphaLock ? .destinationAlpha : .one)
-            attachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
-            attachment.sourceAlphaBlendFactor = erase || alphaLock ? .zero : .one
-            attachment.destinationAlphaBlendFactor = alphaLock ? .one : .oneMinusSourceAlpha
-            return try device.makeRenderPipelineState(descriptor: description)
-        }
-        paintPipeline = try pipeline(erase: false, alphaLock: false)
-        erasePipeline = try pipeline(erase: true, alphaLock: false)
-        alphaPipeline = try pipeline(erase: false, alphaLock: true)
+        let description = MTLRenderPipelineDescriptor()
+        description.vertexFunction = vertex; description.fragmentFunction = fragment
+        let attachment = description.colorAttachments[0]!
+        attachment.pixelFormat = .rgba8Unorm; attachment.isBlendingEnabled = true
+        attachment.rgbBlendOperation = .max; attachment.alphaBlendOperation = .max
+        coveragePipeline = try device.makeRenderPipelineState(descriptor: description)
+        strokePipeline = try device.makeComputePipelineState(function: resolve)
         let viewDescription = MTLRenderPipelineDescriptor()
         viewDescription.vertexFunction = quad; viewDescription.fragmentFunction = display
         viewDescription.colorAttachments[0].pixelFormat = .bgra8Unorm
         viewPipeline = try device.makeRenderPipelineState(descriptor: viewDescription)
         clearPipeline = try device.makeComputePipelineState(function: clear)
         compositePipeline = try device.makeComputePipelineState(function: compose)
+        thumbnailPipeline = try device.makeComputePipelineState(function: thumbnail)
+        for key in ["palette.recent", "palette.saved"] {
+            if let data = defaults.data(forKey: key), let colors = try? JSONDecoder().decode([PaintColor].self, from: data) {
+                let valid = colors.filter(\.isValid)
+                if key == "palette.recent" { recentColors = Array(valid.prefix(8)) }
+                else { colorSet = Array(valid.prefix(64)) }
+            }
+        }
         try newDocument(width: 1024, height: 1024)
     }
 
@@ -183,10 +211,13 @@ final class PaintEngine: ObservableObject {
     }
     private func allocateWorkingTextures() throws {
         let nextComposite = try transparentTexture(), nextA = try makeTexture(), nextB = try makeTexture()
+        let nextGroupA = try makeTexture(), nextGroupB = try makeTexture()
+        let nextStrokeBase = try makeTexture(), nextStrokeCoverage = try makeTexture()
         let nextSelection = try makeTexture(format: .r8Unorm)
         let empty = [UInt8](repeating: 0, count: width * height)
         empty.withUnsafeBytes { nextSelection.replace(region: fullRegion, mipmapLevel: 0, withBytes: $0.baseAddress!, bytesPerRow: width) }
-        composite = nextComposite; scratchA = nextA; scratchB = nextB; selectionTexture = nextSelection
+        composite = nextComposite; scratchA = nextA; scratchB = nextB; groupA = nextGroupA; groupB = nextGroupB; selectionTexture = nextSelection
+        strokeBase = nextStrokeBase; strokeCoverage = nextStrokeCoverage
     }
     private var fullRegion: MTLRegion { MTLRegionMake2D(0, 0, width, height) }
     private func checkCompletion(_ command: MTLCommandBuffer) {
@@ -251,6 +282,7 @@ final class PaintEngine: ObservableObject {
     }
 
     func newDocument(width: Int, height: Int) throws {
+        finishLayerOpacityEdit()
         guard !strokeActive, !isBusy, (64...2048).contains(width), (64...2048).contains(height) else {
             throw PaintDocumentError.invalid("サイズは64〜2048ピクセルにしてください。")
         }
@@ -266,6 +298,7 @@ final class PaintEngine: ObservableObject {
         documentID = UUID(); resetEditingState(); commit()
     }
     private func resetEditingState() {
+        thumbnails.removeAll()
         cancellationPending = false
         undoRecords = []; redoRecords = []; canUndo = false; canRedo = false
         selectionMask = nil; hasSelection = false; processor = nil; strokeLayer = nil; beforeTiles = [:]
@@ -277,10 +310,14 @@ final class PaintEngine: ObservableObject {
         var document = DocumentSnapshot(width: width, height: height,
             layers: layers.map { .init(properties: $0.properties, pixels: read($0.texture)) },
             selectedLayerID: selectedLayerID ?? layers[0].id)
-        document.id = documentID; document.brush = brush; document.color = color
+        document.id = documentID
+        // Only drawing tools may replace the saved pen/pencil settings.
+        document.brush = tool == .pen || tool == .pencil ? brush : rememberedDrawingBrush
+        document.color = color
         return document
     }
     func load(_ snapshot: DocumentSnapshot) throws {
+        finishLayerOpacityEdit()
         guard !strokeActive, !isBusy else { return }
         try snapshot.validate()
         guard waitForGPU() else { throw PaintDocumentError.invalid(gpuFailure!) }
@@ -293,10 +330,12 @@ final class PaintEngine: ObservableObject {
             }
             try allocateWorkingTextures()
             layers = imported
+            layers.first?.properties.clipping = false
         } catch { width = oldWidth; height = oldHeight; throw error }
         selectedLayerID = snapshot.selectedLayerID; documentID = snapshot.id
         brush = snapshot.brush; color = snapshot.color
         tool = brush.kind == .eraser ? .eraser : (brush.kind == .pencil ? .pencil : .pen)
+        toolBrushes = [tool: brush]
         rememberedDrawingTool = tool == .pencil ? .pencil : .pen
         rememberedDrawingBrush = brush
         rememberedDrawingBrush.kind = rememberedDrawingTool == .pencil ? .pencil : .pen
@@ -305,25 +344,59 @@ final class PaintEngine: ObservableObject {
 
     func setTool(_ value: EditorTool) {
         guard !strokeActive, tool != value else { return }
+        if tool.isBrush || tool == .fill { toolBrushes[tool] = brush }
         if tool == .pen || tool == .pencil {
             rememberedDrawingTool = tool; rememberedDrawingBrush = brush
         }
         tool = value
-        if value.isBrush {
-            brush.kind = value == .eraser ? .eraser : (value == .pencil ? .pencil : .pen)
-            brush.hardness = value == .pencil ? 0.6 : 0.85
+        if value.isBrush || value == .fill {
+            var initial = BrushSettings()
+            initial.kind = value == .eraser ? .eraser : (value == .pencil ? .pencil : .pen)
+            initial.hardness = value == .pencil ? 0.6 : 0.85
+            brush = toolBrushes[value] ?? initial
         }
     }
     func setColor(_ value: PaintColor) {
         guard [value.red, value.green, value.blue, value.alpha].allSatisfy(\.isFinite) else { return }
         let clamped = PaintColor(min(1, max(0, value.red)), min(1, max(0, value.green)), min(1, max(0, value.blue)), min(1, max(0, value.alpha)))
         color = clamped
-        recentColors.removeAll { $0 == clamped }; recentColors.insert(clamped, at: 0)
-        if recentColors.count > 8 { recentColors.removeLast() }
+    }
+    private func persistColors(_ colors: [PaintColor], key: String) {
+        if let data = try? JSONEncoder().encode(colors) { colorDefaults.set(data, forKey: key) }
+    }
+    func rememberColor(_ value: PaintColor? = nil) {
+        let used = value ?? color
+        guard used.isValid else { return }
+        recentColors.removeAll { $0.hex == used.hex }; recentColors.insert(used, at: 0)
+        recentColors = Array(recentColors.prefix(8))
+    }
+    func saveColor(_ value: PaintColor? = nil) {
+        let saved = value ?? color
+        guard saved.isValid, !colorSet.contains(where: { $0.hex == saved.hex }), colorSet.count < 64 else { return }
+        colorSet.append(saved)
+    }
+    func removeSavedColor(_ value: PaintColor) { colorSet.removeAll { $0 == value } }
+    func swapColors() {
+        guard !strokeActive, !isBusy else { return }
+        let previous = color; setColor(backgroundColor); backgroundColor = previous
     }
     func beginStroke(_ sample: StrokeSample) {
+        finishLayerOpacityEdit()
         guard gpuFailure == nil, !isBusy, !strokeActive, tool.isBrush, let layer = editableLayer() else { return }
         if tool == .eraser && layer.properties.alphaLocked { return }
+        // Keep the original pixels immutable for this stroke. Coverage accumulates
+        // by maximum, and every preview resolves once against these original pixels.
+        guard let command = queue.makeCommandBuffer(), let copy = command.makeBlitCommandEncoder() else { return }
+        copy.copy(from: layer.texture, sourceSlice: 0, sourceLevel: 0, sourceOrigin: fullRegion.origin,
+                  sourceSize: fullRegion.size, to: strokeBase, destinationSlice: 0, destinationLevel: 0,
+                  destinationOrigin: fullRegion.origin)
+        copy.endEncoding()
+        guard let clear = command.makeComputeCommandEncoder() else { return }
+        var origin = SIMD2<UInt32>(0, 0)
+        clear.setComputePipelineState(clearPipeline); clear.setTexture(strokeCoverage, index: 0)
+        clear.setBytes(&origin, length: 8, index: 0)
+        dispatch(clear, pipeline: clearPipeline, region: fullRegion); clear.endEncoding()
+        guard submit(command) else { return }
         strokeBrush = brush; strokeColor = color; strokeLayer = layer; beforeTiles = [:]
         strokeSeed = Float.random(in: 0...10000)
         processor = StrokeProcessor(settings: strokeBrush)
@@ -344,10 +417,11 @@ final class PaintEngine: ObservableObject {
             markDirty(fullRegion)
         } else if !before.isEmpty {
             let after = before.map { tile in patch(layer.texture, x: tile.x, y: tile.y, width: tile.width, height: tile.height) }
-            record(.pixels(layer.id, before, after, nil, nil)); commit()
+            record(.pixels(layer.id, before, after, nil, nil)); if strokeBrush.kind != .eraser { rememberColor(strokeColor) }; commit()
         }
         cancellationPending = false
         processor = nil; strokeLayer = nil; beforeTiles = [:]; requestDisplay?()
+        scheduleThumbnails()
     }
     func retryPendingCancellation() { if cancellationPending { endStroke(cancelled: true) } }
     private func editableLayer() -> PaintLayer? {
@@ -394,18 +468,27 @@ final class PaintEngine: ObservableObject {
         }
         guard let buffer = device.makeBuffer(bytes: dabs, length: dabs.count * MemoryLayout<GPUDab>.stride),
               let command = queue.makeCommandBuffer() else { errorMessage = "描画用のメモリが不足しています。"; return }
-        let pass = MTLRenderPassDescriptor(); pass.colorAttachments[0].texture = layer.texture
+        let pass = MTLRenderPassDescriptor(); pass.colorAttachments[0].texture = strokeCoverage
         pass.colorAttachments[0].loadAction = .load; pass.colorAttachments[0].storeAction = .store
         guard let encoder = command.makeRenderCommandEncoder(descriptor: pass) else { return }
-        encoder.setRenderPipelineState(strokeBrush.kind == .eraser ? erasePipeline : (layer.properties.alphaLocked ? alphaPipeline : paintPipeline))
+        encoder.setRenderPipelineState(coveragePipeline)
         encoder.setVertexBuffer(buffer, offset: 0, index: 0)
         var size = SIMD2<Float>(Float(width), Float(height)), selected: UInt32 = hasSelection ? 1 : 0
         encoder.setVertexBytes(&size, length: MemoryLayout<SIMD2<Float>>.stride, index: 1)
         encoder.setFragmentBytes(&selected, length: 4, index: 0); encoder.setFragmentTexture(selectionTexture, index: 0)
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6, instanceCount: dabs.count)
         encoder.endEncoding()
+        guard let resolve = command.makeComputeCommandEncoder() else { return }
+        var origin = SIMD2<UInt32>(UInt32(bounds.origin.x), UInt32(bounds.origin.y))
+        var mode = SIMD2<UInt32>(strokeBrush.kind == .eraser ? 1 : 0, layer.properties.alphaLocked ? 1 : 0)
+        resolve.setComputePipelineState(strokePipeline)
+        resolve.setTexture(strokeBase, index: 0); resolve.setTexture(strokeCoverage, index: 1)
+        resolve.setTexture(layer.texture, index: 2)
+        resolve.setBytes(&origin, length: 8, index: 0); resolve.setBytes(&mode, length: 8, index: 1)
+        dispatch(resolve, pipeline: strokePipeline, region: bounds); resolve.endEncoding()
         guard submit(command) else { return }
         gpuWrittenTextures[ObjectIdentifier(layer.texture)] = layer.texture
+        layer.pixelRevision &+= 1
         markDirty(bounds)
     }
 
@@ -429,19 +512,44 @@ final class PaintEngine: ObservableObject {
         clear.setComputePipelineState(clearPipeline); clear.setTexture(scratchA, index: 0)
         clear.setBytes(&origin, length: 8, index: 0); dispatch(clear, pipeline: clearPipeline, region: region); clear.endEncoding()
         var destination = scratchA!, output = scratchB!
-        var base: PaintLayer?
-        for layer in layers {
-            if !layer.properties.clipping { base = layer }
-            guard layer.properties.visible else { continue }
-            guard let encoder = command.makeComputeCommandEncoder() else { return }
-            var settings = SIMD4<Float>(Float(layer.properties.opacity), layer.properties.blend.shaderValue,
-                layer.properties.clipping ? 1 : 0,
-                (base?.properties.visible == true) ? Float(base?.properties.opacity ?? 0) : 0)
+        func compose(_ source: MTLTexture, into target: MTLTexture, output: MTLTexture,
+                     opacity: Double, blend: LayerBlend, preserveAlpha: Bool = false) -> Bool {
+            guard let encoder = command.makeComputeCommandEncoder() else { return false }
+            var settings = SIMD4<Float>(Float(opacity), blend.shaderValue, preserveAlpha ? 1 : 0, 0)
             encoder.setComputePipelineState(compositePipeline)
-            encoder.setTexture(destination, index: 0); encoder.setTexture(layer.texture, index: 1)
-            encoder.setTexture(base?.texture ?? layer.texture, index: 2); encoder.setTexture(output, index: 3)
+            encoder.setTexture(target, index: 0); encoder.setTexture(source, index: 1)
+            encoder.setTexture(source, index: 2); encoder.setTexture(output, index: 3)
             encoder.setBytes(&settings, length: 16, index: 0); encoder.setBytes(&origin, length: 8, index: 1)
             dispatch(encoder, pipeline: compositePipeline, region: region); encoder.endEncoding()
+            return true
+        }
+        var index = 0
+        while index < layers.count {
+            let base = layers[index]
+            var end = index + 1
+            while end < layers.count && layers[end].properties.clipping { end += 1 }
+            defer { index = end }
+            guard base.properties.visible else { continue }
+            var source = base.texture
+            if end > index + 1 {
+                // Compose the clipping group with the base's pixel alpha preserved.
+                // Apply the base layer opacity and blend exactly once, to the group.
+                var group = groupA!, nextGroup = groupB!
+                guard let copy = command.makeBlitCommandEncoder() else { return }
+                copy.copy(from: base.texture, sourceSlice: 0, sourceLevel: 0, sourceOrigin: region.origin,
+                          sourceSize: region.size, to: group, destinationSlice: 0, destinationLevel: 0,
+                          destinationOrigin: region.origin)
+                copy.endEncoding()
+                for clip in layers[(index + 1)..<end] where clip.properties.visible {
+                    guard compose(clip.texture, into: group, output: nextGroup,
+                                  opacity: clip.properties.opacity, blend: clip.properties.blend,
+                                  preserveAlpha: true) else { return }
+                    swap(&group, &nextGroup)
+                }
+                source = group
+            }
+            guard compose(source, into: destination, output: output,
+                          opacity: base.properties.opacity, blend: base.properties.blend) else { return }
             swap(&destination, &output)
         }
         guard let blit = command.makeBlitCommandEncoder() else { return }
@@ -468,7 +576,11 @@ final class PaintEngine: ObservableObject {
         encoder.endEncoding(); command.present(drawable); submit(command)
     }
 
-    private func commit() { revision &+= 1; onCommit?(); requestDisplay?() }
+    private func commit() {
+        thumbnails = thumbnails.filter { id, _ in layers.contains { $0.id == id } }
+        scheduleThumbnails()
+        revision &+= 1; onCommit?(); requestDisplay?()
+    }
     private func record(_ value: EditRecord) {
         redoRecords.removeAll(); undoRecords.append(value)
         while undoRecords.reduce(0, { $0 + $1.byteCost }) > historyBudget || undoRecords.count > 100 { undoRecords.removeFirst() }
@@ -509,7 +621,9 @@ final class PaintEngine: ObservableObject {
         blit.endEncoding()
         guard submit(command) else { return false }
         gpuWrittenTextures[ObjectIdentifier(layer.texture)] = layer.texture
-        return waitForGPU()
+        guard waitForGPU() else { return false }
+        layer.pixelRevision &+= 1
+        return true
     }
     private func apply(_ record: EditRecord, forward: Bool) -> Bool {
         switch record {
@@ -527,56 +641,170 @@ final class PaintEngine: ObservableObject {
         case .properties(let id, let before, let after):
             layers.first { $0.id == id }?.properties = forward ? after : before
         case .reorder(let before, let after):
-            let ids = forward ? after : before
-            layers = ids.compactMap { id in layers.first { $0.id == id } }
+            let properties = forward ? after : before
+            layers = properties.compactMap { item in
+                guard let layer = layers.first(where: { $0.id == item.id }) else { return nil }
+                layer.properties = item; return layer
+            }
+        case .group(let records):
+            for item in (forward ? records : Array(records.reversed())) {
+                guard apply(item, forward: forward) else { return false }
+            }
         }
         if !layers.contains(where: { $0.id == selectedLayerID }) { selectedLayerID = layers.last?.id }
         objectWillChange.send(); markDirty(fullRegion); commit()
         return true
     }
     func undo() {
+        finishLayerOpacityEdit()
         guard !strokeActive, !isBusy, let record = undoRecords.last,
               waitForGPU(), apply(record, forward: false) else { return }
         undoRecords.removeLast(); redoRecords.append(record)
         canUndo = !undoRecords.isEmpty; canRedo = true
     }
     func redo() {
+        finishLayerOpacityEdit()
         guard !strokeActive, !isBusy, let record = redoRecords.last,
               waitForGPU(), apply(record, forward: true) else { return }
         redoRecords.removeLast(); undoRecords.append(record)
         canUndo = true; canRedo = !redoRecords.isEmpty
     }
     func addLayer(duplicate: Bool = false) {
+        finishLayerOpacityEdit()
         guard !strokeActive, !isBusy else { return }
         guard layers.count < DocumentSnapshot.maximumLayers else { errorMessage = "初期版のレイヤー上限は8枚です。"; return }
         do {
             guard waitForGPU() else { return }
             let texture = try transparentTexture()
-            var properties = LayerProperties(name: "レイヤー\(layers.count + 1)")
+            var number = 1
+            while layers.contains(where: { $0.properties.name == "レイヤー\(number)" }) { number += 1 }
+            var properties = LayerProperties(name: "レイヤー\(number)")
             if duplicate, let selected = selectedLayer {
                 replace(texture, data: read(selected.texture)); properties = selected.properties
                 properties.id = UUID(); properties.name = String((properties.name + " コピー").prefix(256))
             }
             let layer = PaintLayer(properties: properties, texture: texture)
             let index = (layers.firstIndex { $0.id == selectedLayerID }).map { $0 + 1 } ?? layers.count
+            if index < layers.count && layers[index].properties.clipping { layer.properties.clipping = true }
             layers.insert(layer, at: index); selectedLayerID = layer.id
             record(.insert(layer, index)); markDirty(fullRegion); commit()
         } catch { errorMessage = error.localizedDescription }
     }
     func deleteLayer() {
+        finishLayerOpacityEdit()
         guard gpuFailure == nil, !strokeActive, !isBusy, layers.count > 1, let index = layers.firstIndex(where: { $0.id == selectedLayerID }) else { return }
         let removed = layers.remove(at: index); selectedLayerID = layers[min(index, layers.count - 1)].id
-        record(.remove(removed, index)); markDirty(fullRegion); commit()
+        var records: [EditRecord] = [.remove(removed, index)]
+        if let first = layers.first, first.properties.clipping {
+            let before = first.properties; first.properties.clipping = false
+            records.append(.properties(first.id, before, first.properties))
+        }
+        record(.group(records)); markDirty(fullRegion); commit()
     }
     func moveLayer(_ direction: Int) {
-        guard gpuFailure == nil, !strokeActive, !isBusy, let index = layers.firstIndex(where: { $0.id == selectedLayerID }),
+        guard let index = layers.firstIndex(where: { $0.id == selectedLayerID }),
               layers.indices.contains(index + direction) else { return }
-        let before = layers.map(\.id); layers.swapAt(index, index + direction)
-        record(.reorder(before, layers.map(\.id))); markDirty(fullRegion); commit()
+        reorderLayer(layers[index].id, to: index + direction)
+    }
+    func reorderLayer(_ id: UUID, to index: Int) {
+        guard gpuFailure == nil, !strokeActive, !isBusy, layers.indices.contains(index),
+              let old = layers.firstIndex(where: { $0.id == id }), old != index else { return }
+        finishLayerOpacityEdit()
+        let before = layers.map(\.properties)
+        let layer = layers.remove(at: old); layers.insert(layer, at: index)
+        layers.first?.properties.clipping = false
+        record(.reorder(before, layers.map(\.properties))); markDirty(fullRegion); commit()
+    }
+    func previewLayerOpacity(_ id: UUID, value: Double) {
+        guard gpuFailure == nil, !strokeActive, !isBusy, value.isFinite,
+              let layer = layers.first(where: { $0.id == id }) else { return }
+        if opacityEdit?.id != id { finishLayerOpacityEdit(); opacityEdit = (id, layer.properties) }
+        objectWillChange.send(); layer.properties.opacity = min(1, max(0, value))
+        markDirty(fullRegion)
+    }
+    func finishLayerOpacityEdit() {
+        guard let edit = opacityEdit else { return }
+        opacityEdit = nil
+        guard let layer = layers.first(where: { $0.id == edit.id }), edit.before != layer.properties else { return }
+        record(.properties(edit.id, edit.before, layer.properties)); commit()
+    }
+    func thumbnail(for layer: PaintLayer) -> CGImage? {
+        // SwiftUI only reads the cache. Keep the last image while a replacement
+        // is pending; never wait for the GPU or publish errors during view updates.
+        thumbnails[layer.id]?.image
+    }
+    private func scheduleThumbnails() {
+        guard thumbnailRefreshTask == nil else { return }
+        thumbnailRefreshTask = Task { [weak self] in
+            // Coalesce rapid commits without regenerating during an active stroke.
+            try? await Task.sleep(for: .milliseconds(100))
+            guard let self else { return }
+            thumbnailRefreshTask = nil
+            guard !strokeActive, !isBusy, gpuFailure == nil else { return }
+            for layer in layers where thumbnails[layer.id]?.revision != layer.pixelRevision {
+                generateThumbnail(for: layer)
+            }
+        }
+    }
+    private func generateThumbnail(for layer: PaintLayer) {
+        let identity = layer.instanceID, version = layer.pixelRevision
+        guard !pendingThumbnails.contains(identity) else { return }
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: 80, height: 80, mipmapped: false)
+        descriptor.usage = [.shaderWrite]
+        #if os(macOS)
+        descriptor.storageMode = device.hasUnifiedMemory ? .shared : .managed
+        #else
+        descriptor.storageMode = .shared
+        #endif
+        guard let texture = device.makeTexture(descriptor: descriptor),
+              let command = queue.makeCommandBuffer(), let encoder = command.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(thumbnailPipeline)
+        encoder.setTexture(layer.texture, index: 0); encoder.setTexture(texture, index: 1)
+        dispatch(encoder, pipeline: thumbnailPipeline, region: MTLRegionMake2D(0, 0, 80, 80))
+        encoder.endEncoding()
+        #if os(macOS)
+        if texture.storageMode == .managed {
+            guard let blit = command.makeBlitCommandEncoder() else { return }
+            blit.synchronize(resource: texture); blit.endEncoding()
+        }
+        #endif
+        command.addCompletedHandler { [weak self] completed in
+            let image: CGImage?
+            if completed.status == .completed {
+                // Only 25.6 KB crosses back to the CPU, on the completion queue.
+                var data = Data(count: 80 * 80 * 4)
+                data.withUnsafeMutableBytes {
+                    texture.getBytes($0.baseAddress!, bytesPerRow: 320, from: MTLRegionMake2D(0, 0, 80, 80), mipmapLevel: 0)
+                }
+                image = CGDataProvider(data: data as CFData).flatMap { provider in
+                    CGImage(width: 80, height: 80, bitsPerComponent: 8, bitsPerPixel: 32,
+                        bytesPerRow: 320, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue),
+                        provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+                }
+            } else { image = nil }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                pendingThumbnails.remove(identity)
+                checkCompletion(completed)
+                guard let layer = layers.first(where: { $0.instanceID == identity }) else { return }
+                guard layer.pixelRevision == version else { scheduleThumbnails(); return }
+                guard let image, gpuFailure == nil else { return }
+                objectWillChange.send()
+                thumbnails[layer.id] = (version, image)
+                #if DEBUG
+                thumbnailGenerationCount += 1; thumbnailReadbackBytes += 80 * 80 * 4
+                #endif
+            }
+        }
+        pendingThumbnails.insert(identity)
+        if !submit(command) { pendingThumbnails.remove(identity) }
     }
     func changeLayer(_ id: UUID, _ change: (inout LayerProperties) -> Void) {
         guard gpuFailure == nil, !strokeActive, !isBusy, let layer = layers.first(where: { $0.id == id }) else { return }
+        finishLayerOpacityEdit()
         let before = layer.properties; var after = before; change(&after)
+        if layers.first?.id == id { after.clipping = false }
         guard after.name.utf8.count <= 64 * 1024, after.opacity.isFinite, (0...1).contains(after.opacity) else {
             errorMessage = "レイヤーの設定または名前が不正です。"; return
         }
@@ -588,8 +816,9 @@ final class PaintEngine: ObservableObject {
 
     private func setSelectionMask(_ mask: [UInt8]?) {
         guard waitForGPU() else { return }
-        selectionMask = mask; hasSelection = mask?.contains(where: { $0 != 0 }) == true
-        let values = mask ?? [UInt8](repeating: 0, count: width * height)
+        let normalized = mask?.contains(where: { $0 != 0 }) == true ? mask : nil
+        selectionMask = normalized; hasSelection = normalized != nil
+        let values = normalized ?? [UInt8](repeating: 0, count: width * height)
         values.withUnsafeBytes { selectionTexture.replace(region: fullRegion, mipmapLevel: 0, withBytes: $0.baseAddress!, bytesPerRow: width) }
         requestDisplay?()
     }
@@ -613,7 +842,7 @@ final class PaintEngine: ObservableObject {
             }
         }
     }
-    private func rasterEdit(_ operation: @escaping @Sendable ([UInt8], [UInt8]?, Int, Int) -> (pixels: [UInt8], mask: [UInt8]?)) {
+    private func rasterEdit(usedColor: PaintColor? = nil, _ operation: @escaping @Sendable ([UInt8], [UInt8]?, Int, Int) -> (pixels: [UInt8], mask: [UInt8]?)) {
         guard !isBusy, !strokeActive, let layer = editableLayer() else { return }
         guard waitForGPU() else { return }; isBusy = true
         let before = allPatches(layer.texture), pixels = [UInt8](read(layer.texture))
@@ -626,10 +855,12 @@ final class PaintEngine: ObservableObject {
             let after = allPatches(layer.texture)
             var changedBefore: [TilePatch] = [], changedAfter: [TilePatch] = []
             for (a, b) in zip(before, after) where a.data != b.data { changedBefore.append(a); changedAfter.append(b) }
+            if !changedBefore.isEmpty { layer.pixelRevision &+= 1 }
             let changedMask = oldMask != result.mask
             if !changedBefore.isEmpty || changedMask {
                 record(.pixels(layer.id, changedBefore, changedAfter, changedMask ? oldMask : nil, changedMask ? result.mask : nil))
                 if changedMask { setSelectionMask(result.mask) }
+                if let usedColor { rememberColor(usedColor) }
                 markDirty(fullRegion); commit()
             }
             isBusy = false
@@ -637,11 +868,15 @@ final class PaintEngine: ObservableObject {
     }
     func fill(at point: PaintPoint) {
         guard (0..<Double(width)).contains(point.x), (0..<Double(height)).contains(point.y) else { return }
-        let color = self.color, tolerance = fillTolerance, alphaLocked = selectedLayer?.properties.alphaLocked ?? false
-        rasterEdit { pixels, mask, width, height in
+        guard !isBusy, !strokeActive else { return }
+        updateComposite(); guard waitForGPU(), dirty == nil else { return }
+        let reference = [UInt8](read(composite))
+        let color = PaintColor(self.color.red, self.color.green, self.color.blue, self.color.alpha * brush.opacity)
+        let tolerance = fillTolerance, expansion = fillExpansion, alphaLocked = selectedLayer?.properties.alphaLocked ?? false
+        rasterEdit(usedColor: self.color) { pixels, mask, width, height in
             var result = pixels
             RasterOperations.floodFill(pixels: &result, width: width, height: height, x: Int(point.x), y: Int(point.y),
-                color: color, tolerance: tolerance, mask: mask, alphaLocked: alphaLocked)
+                color: color, tolerance: tolerance, mask: mask, alphaLocked: alphaLocked, reference: reference, expansion: expansion)
             return (result, mask)
         }
     }
@@ -655,10 +890,10 @@ final class PaintEngine: ObservableObject {
         }
     }
     func clearSelectedPixels() {
-        guard selectedLayer?.properties.alphaLocked != true else { return }
+        guard hasSelection, selectedLayer?.properties.alphaLocked != true else { return }
         rasterEdit { pixels, mask, _, _ in
             var result = pixels
-            for index in stride(from: 0, to: pixels.count, by: 4) where mask == nil || mask![index / 4] != 0 {
+            for index in stride(from: 0, to: pixels.count, by: 4) where (mask?[index / 4] ?? 0) != 0 {
                 for c in 0..<4 { result[index + c] = 0 }
             }
             return (result, mask)

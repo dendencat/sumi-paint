@@ -63,6 +63,16 @@
 				</array>
 			</dict>
 		</dict>
+		<dict>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+			</array>
+			<key>UTTypeDescription</key>
+			<string>Sumi Paintレイヤー</string>
+			<key>UTTypeIdentifier</key>
+			<string>app.dendencat.sumipaint.layer</string>
+		</dict>
 	</array>
 </dict>
 </plist>
